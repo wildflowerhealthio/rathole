@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
 use backoff::{backoff::Backoff, Notify};
 use socket2::{SockRef, TcpKeepalive};
-use std::{future::Future, net::SocketAddr, time::Duration};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use std::{fmt::Debug, future::Future, net::SocketAddr, time::Duration};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::{
     net::{lookup_host, TcpStream, ToSocketAddrs, UdpSocket},
     sync::broadcast,
@@ -12,6 +12,14 @@ use tracing::trace;
 use url::Url;
 
 use crate::transport::AddrMaybeCached;
+
+/// A byte stream of any kind: a data channel of any transport, or a visitor
+pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send + Sync + Debug + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync + Debug + 'static> AsyncStream for T {}
+
+/// A stream passed between the tunnel and whatever serves its services
+pub type DataChannelStream = Box<dyn AsyncStream>;
 
 // Tokio hesitates to expose this option...So we have to do it on our own :(
 // The good news is that using socket2 it can be easily done, without losing portability.

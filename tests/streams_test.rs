@@ -1,0 +1,219 @@
+#![cfg(all(feature = "client", feature = "server"))]
+
+use anyhow::{Context, Result};
+use rathole::{ClientEvent, Config};
+use std::future::Future;
+use std::time::Duration;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::{broadcast, mpsc},
+    time,
+};
+
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+// An address on loopback with a port that is free, for now
+async fn free_addr() -> Result<String> {
+    let l = TcpListener::bind("127.0.0.1:0").await?;
+    Ok(l.local_addr()?.to_string())
+}
+
+// A server with the TCP service `echo` exposed at `echo_addr`, and the UDP
+// service `dns`
+fn server_config(bind_addr: &str, echo_addr: &str, dns_addr: &str) -> Result<Config> {
+    format!(
+        r#"
+        [server]
+        bind_addr = "{bind_addr}"
+
+        [server.services.echo]
+        bind_addr = "{echo_addr}"
+        token = "echo_token"
+
+        [server.services.dns]
+        type = "udp"
+        bind_addr = "{dns_addr}"
+        token = "dns_token"
+    "#
+    )
+    .parse()
+}
+
+// A client of the TCP service `echo`, served at `echo_addr`, and the UDP
+// service `dns`
+fn client_config(remote_addr: &str, echo_addr: &str) -> Result<Config> {
+    format!(
+        r#"
+        [client]
+        remote_addr = "{remote_addr}"
+
+        [client.services.echo]
+        local_addr = "{echo_addr}"
+        token = "echo_token"
+
+        [client.services.dns]
+        type = "udp"
+        local_addr = "127.0.0.1:53"
+        token = "dns_token"
+    "#
+    )
+    .parse()
+}
+
+// Echo everything read from `stream`
+fn spawn_echo<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) {
+    tokio::spawn(async move {
+        let (mut rd, mut wr) = tokio::io::split(stream);
+        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+    });
+}
+
+// Send `ping` over `stream` and expect it back
+async fn ping<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
+    stream.write_all(b"ping").await?;
+    let mut rd = [0u8; 4];
+    time::timeout(TIMEOUT, stream.read_exact(&mut rd))
+        .await
+        .context("Not echoed")??;
+    assert_eq!(&rd, b"ping");
+    Ok(())
+}
+
+// Visit `addr` until it echoes, as it is not listened at until the client
+// connects
+async fn ping_addr(addr: &str) -> Result<()> {
+    time::timeout(TIMEOUT, async {
+        loop {
+            if let Ok(mut conn) = TcpStream::connect(addr).await {
+                if ping(&mut conn).await.is_ok() {
+                    return;
+                }
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("The visitor was never echoed")
+}
+
+async fn recv<T>(events: &mut mpsc::UnboundedReceiver<T>) -> Result<T> {
+    time::timeout(TIMEOUT, events.recv())
+        .await
+        .context("No event")?
+        .context("The events ended")
+}
+
+// Assert no event comes within a while
+async fn assert_no_event<T: std::fmt::Debug>(events: &mut mpsc::UnboundedReceiver<T>) {
+    if let Ok(Some(e)) = time::timeout(Duration::from_millis(500), events.recv()).await {
+        panic!("Unexpected event {:?}", e);
+    }
+}
+
+// Run `f` with its own shutdown channel and no config changes
+fn spawn_instance<F, Fut>(f: F) -> (broadcast::Sender<bool>, tokio::task::JoinHandle<Result<()>>)
+where
+    F: FnOnce(broadcast::Receiver<bool>, mpsc::Receiver<rathole::ConfigChange>) -> Fut,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let (update_tx, update_rx) = mpsc::channel(1);
+    let task = f(shutdown_rx, update_rx);
+    (
+        shutdown_tx,
+        tokio::spawn(async move {
+            let _update_tx = update_tx;
+            task.await
+        }),
+    )
+}
+
+#[tokio::test]
+async fn client_streams() -> Result<()> {
+    let (bind_addr, echo_addr, dns_addr) =
+        (free_addr().await?, free_addr().await?, free_addr().await?);
+    let (server_shutdown_tx, server) = spawn_instance(|s, u| {
+        rathole::run_server(
+            server_config(&bind_addr, &echo_addr, &dns_addr).unwrap(),
+            s,
+            u,
+        )
+    });
+
+    // `local_addr` is not connected to
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let config = client_config(&bind_addr, "127.0.0.1:1")?;
+    let (client_shutdown_tx, client) =
+        spawn_instance(|s, u| rathole::run_client_streams(config, s, u, events_tx));
+
+    // Only the TCP service is reported
+    let mut streams = match recv(&mut events).await? {
+        ClientEvent::ServiceUp { config, streams } => {
+            assert_eq!(config.name, "echo");
+            streams
+        }
+        e => panic!("Unexpected event {:?}", e),
+    };
+    tokio::spawn(async move {
+        while let Some(stream) = streams.recv().await {
+            spawn_echo(stream);
+        }
+    });
+
+    // A visitor at the server reaches the stream
+    ping_addr(&echo_addr).await?;
+    assert_no_event(&mut events).await;
+
+    client_shutdown_tx.send(true)?;
+    client.await??;
+    match recv(&mut events).await? {
+        ClientEvent::ServiceDown { name } => assert_eq!(name, "echo"),
+        e => panic!("Unexpected event {:?}", e),
+    }
+    assert!(events.recv().await.is_none());
+
+    server_shutdown_tx.send(true)?;
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_addr_forwarding() -> Result<()> {
+    let (bind_addr, echo_addr, dns_addr) =
+        (free_addr().await?, free_addr().await?, free_addr().await?);
+
+    let local = TcpListener::bind("127.0.0.1:0").await?;
+    let local_addr = local.local_addr()?.to_string();
+    tokio::spawn(async move {
+        while let Ok((conn, _)) = local.accept().await {
+            spawn_echo(conn);
+        }
+    });
+
+    let (server_shutdown_tx, server) = spawn_instance(|s, u| {
+        rathole::run_server(
+            server_config(&bind_addr, &echo_addr, &dns_addr).unwrap(),
+            s,
+            u,
+        )
+    });
+    let config = client_config(&bind_addr, &local_addr)?;
+    let (client_shutdown_tx, client) = spawn_instance(|s, u| rathole::run_client(config, s, u));
+
+    ping_addr(&echo_addr).await?;
+    // Several visitors at once
+    let mut visitors = Vec::new();
+    for _ in 0..4 {
+        visitors.push(TcpStream::connect(&echo_addr).await?);
+    }
+    for v in &mut visitors {
+        ping(v).await?;
+    }
+
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    client.await??;
+    server.await??;
+    Ok(())
+}
