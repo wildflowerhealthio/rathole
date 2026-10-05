@@ -166,14 +166,14 @@ struct Client<T: Transport> {
     config: ClientConfig,
     service_handles: HashMap<String, ControlChannelHandle>,
     transport: Arc<T>,
-    event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
+    service_event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
 }
 
 impl<T: 'static + Transport> Client<T> {
     // Create a Client from `[client]` config block
     async fn from(
         config: ClientConfig,
-        event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
+        service_event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
     ) -> Result<Client<T>> {
         let transport =
             Arc::new(T::new(&config.transport).with_context(|| "Failed to create the transport")?);
@@ -181,7 +181,7 @@ impl<T: 'static + Transport> Client<T> {
             config,
             service_handles: HashMap::new(),
             transport,
-            event_tx,
+            service_event_tx,
         })
     }
 
@@ -198,7 +198,7 @@ impl<T: 'static + Transport> Client<T> {
                 self.config.remote_addr.clone(),
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
-                self.event_tx.clone(),
+                self.service_event_tx.clone(),
             );
             self.service_handles.insert(name.clone(), handle);
         }
@@ -245,7 +245,7 @@ impl<T: 'static + Transport> Client<T> {
                         self.config.remote_addr.clone(),
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
-                        self.event_tx.clone(),
+                        self.service_event_tx.clone(),
                     );
                     let _ = self.service_handles.insert(name, handle);
                 }
