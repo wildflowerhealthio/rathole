@@ -32,21 +32,23 @@ use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE
 
 const VISITOR_STREAM_QUEUE_SIZE: usize = 32; // The capacity of each service's visitor stream queue
 
-/// A change in the TCP services whose visitor streams are taken by
-/// `run_client_with_visitor_queue`'s caller
+/// A change in the services run by `run_client_with_visitor_queue`
 #[derive(Debug)]
 pub enum ClientServiceEvent {
-    /// The service started, and its control channel is connecting to the
-    /// server. Each visitor of the service arrives on `visitor_stream_rx`, for
-    /// the caller to serve in place of a local connection to `local_addr`. A
-    /// visitor stream is a data channel that the server has sent
+    /// The TCP service started, and its control channel is connecting to the
+    /// server. Each visitor arrives on `visitor_stream_rx` as a visitor stream,
+    /// for the caller to serve in place of a local connection to `local_addr`.
+    /// A visitor stream is a data channel that the server has sent
     /// `StartForwardTcp` on, so it carries the bytes of exactly one visitor
-    Started {
+    TcpStarted {
         config: ClientServiceConfig,
         visitor_stream_rx: mpsc::Receiver<Box<dyn AsyncStream>>,
     },
-    /// The service stopped. Its `visitor_stream_rx` ends once the visitor
-    /// streams already opened are sent
+    /// The UDP service started, and its control channel is connecting to the
+    /// server. Its visitors are forwarded to `local_addr` as usual
+    UdpStarted { config: ClientServiceConfig },
+    /// The service stopped. The `visitor_stream_rx` of a TCP service ends once
+    /// the visitor streams already opened are sent
     Stopped { name: String },
 }
 
@@ -62,7 +64,7 @@ pub async fn run_client(
     // once the client has stopped every service
     let local_forwarding_client_event_handler = async move {
         while let Some(event) = event_rx.recv().await {
-            if let ClientServiceEvent::Started {
+            if let ClientServiceEvent::TcpStarted {
                 config,
                 visitor_stream_rx,
             } = event
@@ -107,8 +109,8 @@ async fn forward_received_streams_to_local_addr(
 /// Run a client that makes no local connections for TCP services. Instead each
 /// TCP service reports a visitor queue in `event_tx`, and its visitor streams
 /// come out of the queue for the caller to serve, until `shutdown_rx` fires.
-/// UDP services are forwarded to their `local_addr` as usual, and produce no
-/// events.
+/// UDP services are reported too, but are forwarded to their `local_addr` as
+/// usual.
 pub async fn run_client_with_visitor_queue(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -350,7 +352,11 @@ async fn run_data_channel_for_tcp(mut conn: Box<dyn AsyncStream>, local_addr: &s
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(
+    conn: T::Stream,
+    local_addr: &str,
+    prefer_ipv6: bool,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -495,7 +501,7 @@ struct ControlChannel<T: Transport> {
 // Dropping it will also drop the actual control channel
 struct ControlChannelHandle {
     shutdown_tx: oneshot::Sender<u8>,
-    _stopped: Option<ServiceStoppedGuard>, // Reports the TCP service stopped when dropped
+    _stopped: ServiceStoppedGuard, // Reports the service stopped when dropped
 }
 
 struct ServiceStoppedGuard {
@@ -620,22 +626,22 @@ impl ControlChannelHandle {
         info!("Starting {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        // Report a TCP service started, with where its visitor streams are sent.
-        // UDP data channels still make their own local connection to
-        // `local_addr`, so there is nothing to report
+        // Report the service started, with where a TCP service's visitor
+        // streams are sent. UDP data channels still make their own local
+        // connection to `local_addr`
         let (visitor_stream_tx, visitor_stream_rx) = mpsc::channel(VISITOR_STREAM_QUEUE_SIZE);
-        let stopped = match service.service_type {
-            ServiceType::Tcp => {
-                let _ = event_tx.send(ClientServiceEvent::Started {
-                    config: service.clone(),
-                    visitor_stream_rx,
-                });
-                Some(ServiceStoppedGuard {
-                    name: service.name.clone(),
-                    event_tx,
-                })
-            }
-            ServiceType::Udp => None,
+        let _ = event_tx.send(match service.service_type {
+            ServiceType::Tcp => ClientServiceEvent::TcpStarted {
+                config: service.clone(),
+                visitor_stream_rx,
+            },
+            ServiceType::Udp => ClientServiceEvent::UdpStarted {
+                config: service.clone(),
+            },
+        });
+        let stopped = ServiceStoppedGuard {
+            name: service.name.clone(),
+            event_tx,
         };
 
         let mut retry_backoff = run_control_chan_backoff(service.retry_interval.unwrap());

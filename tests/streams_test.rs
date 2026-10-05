@@ -218,7 +218,7 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
 
 // Run a client that serves the visitor streams of each TCP service as tests/common
 // serves the service. Each service that starts stops by the end, and only TCP
-// services start
+// services have visitor streams
 async fn run_rathole_client(
     config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -237,7 +237,7 @@ async fn run_rathole_client(
     let client_event_handler = async {
         while let Some(e) = client_event_rx.recv().await {
             match e {
-                ClientServiceEvent::Started {
+                ClientServiceEvent::TcpStarted {
                     config,
                     mut visitor_stream_rx,
                 } => {
@@ -253,6 +253,15 @@ async fn run_rathole_client(
                             serve(&config.name, visitor_stream);
                         }
                     });
+                }
+                ClientServiceEvent::UdpStarted { config } => {
+                    assert_eq!(config.service_type, ServiceType::Udp);
+                    assert!(
+                        !up_service_names.contains(&config.name),
+                        "{} started twice",
+                        config.name
+                    );
+                    up_service_names.push(config.name.clone());
                 }
                 ClientServiceEvent::Stopped {
                     name: downing_service_name,
@@ -302,7 +311,7 @@ fn serve(name: &str, visitor_stream: Box<dyn AsyncStream>) {
 // Run a server that accepts the visitors of each TCP service at its
 // `bind_addr` itself, and sends them to the client of the service while it is
 // connected. Each service that connects disconnects by the end, and only TCP
-// services connect
+// services take visitors
 async fn run_rathole_server(
     config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -311,7 +320,8 @@ async fn run_rathole_server(
     let (server_event_tx, mut server_event_rx) = mpsc::unbounded_channel();
     let (_, config_change_rx) = mpsc::channel(1);
 
-    let up_visitor_txs: Arc<Mutex<HashMap<String, mpsc::Sender<Box<dyn AsyncStream>>>>> =
+    // The visitor queue of each connected service, or `None` for a UDP service
+    let up_visitor_txs: Arc<Mutex<HashMap<String, Option<mpsc::Sender<Box<dyn AsyncStream>>>>>> =
         Arc::default();
     let mut listeners = Vec::new();
     for service in config.server.as_ref().unwrap().services.values() {
@@ -322,7 +332,7 @@ async fn run_rathole_server(
         let (name, up) = (service.name.clone(), up_visitor_txs.clone());
         listeners.push(tokio::spawn(async move {
             while let std::result::Result::Ok((conn, _)) = tcp_listener.accept().await {
-                let visitor_tx = up.lock().unwrap().get(&name).cloned();
+                let visitor_tx = up.lock().unwrap().get(&name).cloned().flatten();
                 if let Some(visitor_tx) = visitor_tx {
                     let _ = visitor_tx.send(Box::new(conn)).await;
                 }
@@ -339,12 +349,20 @@ async fn run_rathole_server(
     let track = async {
         while let Some(e) = server_event_rx.recv().await {
             match e {
-                ServerServiceEvent::Connected { config, visitor_tx } => {
+                ServerServiceEvent::TcpConnected { config, visitor_tx } => {
                     assert_eq!(config.service_type, ServiceType::Tcp);
                     let old = up_visitor_txs
                         .lock()
                         .unwrap()
-                        .insert(config.name.clone(), visitor_tx);
+                        .insert(config.name.clone(), Some(visitor_tx));
+                    assert!(old.is_none(), "{} connected twice", config.name);
+                }
+                ServerServiceEvent::UdpConnected { config } => {
+                    assert_eq!(config.service_type, ServiceType::Udp);
+                    let old = up_visitor_txs
+                        .lock()
+                        .unwrap()
+                        .insert(config.name.clone(), None);
                     assert!(old.is_none(), "{} connected twice", config.name);
                 }
                 ServerServiceEvent::Disconnected { name } => {

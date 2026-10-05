@@ -38,21 +38,23 @@ const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP serv
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
-/// A change in the TCP services whose visitors are sent by
-/// `run_server_with_visitor_queue`'s caller
+/// A change in the services run by `run_server_with_visitor_queue`
 #[derive(Debug)]
 pub enum ServerServiceEvent {
-    /// The control channel of the service was established. Visitors sent on
-    /// `visitor_tx` are forwarded to the client, each over its own data
+    /// The control channel of the TCP service was established. Visitors sent
+    /// on `visitor_tx` are forwarded to the client, each over its own data
     /// channel, in place of those accepted at `bind_addr`
-    Connected {
+    TcpConnected {
         config: ServerServiceConfig,
         visitor_tx: mpsc::Sender<Box<dyn AsyncStream>>,
     },
+    /// The control channel of the UDP service was established. Its visitors
+    /// are accepted at `bind_addr` as usual
+    UdpConnected { config: ServerServiceConfig },
     /// The service's control channel was replaced by a new one, or dropped
     /// as the service was removed or the server stopped. A service whose
-    /// control channel dies stays connected until then, though its `visitor_tx`
-    /// closes once the server notices
+    /// control channel dies stays connected until then, though the `visitor_tx`
+    /// of a TCP service closes once the server notices
     Disconnected { name: String },
 }
 
@@ -73,12 +75,13 @@ pub async fn run_server(
         tokio::select! {
             ret = &mut server => break ret,
             Some(e) = event_rx.recv() => match e {
-                ServerServiceEvent::Connected { config, visitor_tx } => {
+                ServerServiceEvent::TcpConnected { config, visitor_tx } => {
                     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
                     let span = info_span!("handle", service = %config.name);
                     span.in_scope(|| tcp_listen_and_send(config.bind_addr, visitor_tx, shutdown_rx));
                     listener_shutdown_txs.insert(config.name, shutdown_tx);
                 }
+                ServerServiceEvent::UdpConnected { .. } => (),
                 ServerServiceEvent::Disconnected { name } => {
                     listener_shutdown_txs.remove(&name);
                 }
@@ -87,10 +90,10 @@ pub async fn run_server(
     }
 }
 
-/// Run a server that binds no visitor listeners. Instead each TCP service
-/// reports a visitor queue in `event_tx`, and the caller puts the service's
-/// visitors into the queue, until `shutdown_rx` fires. UDP services listen at
-/// their `bind_addr` as usual, and produce no events.
+/// Run a server that binds no visitor listeners for TCP services. Instead each
+/// TCP service reports a visitor queue in `event_tx`, and the caller puts the
+/// service's visitors into the queue, until `shutdown_rx` fires. UDP services
+/// are reported too, but listen at their `bind_addr` as usual.
 pub async fn run_server_with_visitor_queue(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -460,17 +463,15 @@ pub struct ControlChannelHandle<T: Transport> {
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<T::Stream>,
     service: ServerServiceConfig,
-    // Reports a TCP service disconnected when dropped
-    event_tx: Option<mpsc::UnboundedSender<ServerServiceEvent>>,
+    // Reports the service disconnected when dropped
+    event_tx: mpsc::UnboundedSender<ServerServiceEvent>,
 }
 
 impl<T: Transport> Drop for ControlChannelHandle<T> {
     fn drop(&mut self) {
-        if let Some(event_tx) = &self.event_tx {
-            let _ = event_tx.send(ServerServiceEvent::Disconnected {
-                name: self.service.name.clone(),
-            });
-        }
+        let _ = self.event_tx.send(ServerServiceEvent::Disconnected {
+            name: self.service.name.clone(),
+        });
     }
 }
 
@@ -508,24 +509,25 @@ where
             };
         }
 
-        // Report a TCP service connected, with where its visitors are sent. A UDP
-        // service listens at `bind_addr` itself, so there is nothing to report
+        // Report the service connected, with where a TCP service's visitors are
+        // sent. A UDP service listens at `bind_addr` itself
         let (visitor_tx, visitor_rx) = mpsc::channel(CHAN_SIZE);
         let (pool_visitor_tx, pool_visitor_rx) = mpsc::channel(CHAN_SIZE);
-        let event_tx = match service.service_type {
+        let _ = event_tx.send(match service.service_type {
             ServiceType::Tcp => {
                 tokio::spawn(
                     request_data_channels(visitor_rx, data_ch_req_tx.clone(), pool_visitor_tx)
                         .instrument(Span::current()),
                 );
-                let _ = event_tx.send(ServerServiceEvent::Connected {
+                ServerServiceEvent::TcpConnected {
                     config: service.clone(),
                     visitor_tx,
-                });
-                Some(event_tx)
+                }
             }
-            ServiceType::Udp => None,
-        };
+            ServiceType::Udp => ServerServiceEvent::UdpConnected {
+                config: service.clone(),
+            },
+        });
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
