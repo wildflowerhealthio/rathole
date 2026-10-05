@@ -12,7 +12,7 @@ use cli::KeypairType;
 pub use config::{ClientServiceConfig, Config, ServerServiceConfig, ServiceType};
 pub use config_watcher::{ClientServiceChange, ConfigChange, ServerServiceChange};
 pub use constants::UDP_BUFFER_SIZE;
-pub use helper::{AsyncStream, DataChannelStream};
+pub use helper::{AsyncStream, BoxedStream};
 
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
@@ -21,12 +21,12 @@ use tracing::{debug, info};
 #[cfg(feature = "client")]
 mod client;
 #[cfg(feature = "client")]
-pub use client::{run_client, run_client_streams, ClientEvent};
+pub use client::{run_client, run_client_with_events, ClientEvent};
 
 #[cfg(feature = "server")]
 mod server;
 #[cfg(feature = "server")]
-pub use server::{run_server, run_server_streams, ServerEvent, VisitorSender};
+pub use server::{run_server, run_server_with_events, ServerEvent, VisitorSender};
 
 use crate::config_watcher::ConfigWatcherHandle;
 

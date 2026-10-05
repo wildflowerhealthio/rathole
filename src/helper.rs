@@ -18,8 +18,9 @@ pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send + Sync + Debug + 's
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync + Debug + 'static> AsyncStream for T {}
 
-/// A stream passed between the tunnel and whatever serves its services
-pub type DataChannelStream = Box<dyn AsyncStream>;
+/// A boxed `AsyncStream`: a visitor on the server, or a data channel on the
+/// client
+pub type BoxedStream = Box<dyn AsyncStream>;
 
 // Tokio hesitates to expose this option...So we have to do it on our own :(
 // The good news is that using socket2 it can be easily done, without losing portability.

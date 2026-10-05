@@ -1,7 +1,7 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
-use crate::helper::{retry_notify_with_deadline, write_and_flush, DataChannelStream};
+use crate::helper::{retry_notify_with_deadline, write_and_flush, BoxedStream};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
@@ -39,36 +39,35 @@ const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
 /// A change in the TCP services whose visitors are sent by
-/// `run_server_streams`'s caller
+/// `run_server_with_events`'s caller
 #[derive(Debug)]
 pub enum ServerEvent {
-    /// The client of the service connected. Visitors sent on `visitors` are
-    /// forwarded to it, in place of those accepted at `bind_addr`
+    /// The control channel of the service was established. Visitors sent on
+    /// `visitors` are forwarded to the client over data channels, in place of
+    /// those accepted at `bind_addr`
     ServiceUp {
         config: ServerServiceConfig,
         visitors: VisitorSender,
     },
     /// The service's control channel was replaced by a new one, or dropped
-    /// as the service was removed or the server stopped. A control channel
-    /// that dies stays up until then, though its `visitors` fail once the
-    /// server notices
+    /// as the service was removed or the server stopped. A service whose
+    /// control channel dies stays up until then, though its `visitors` fail
+    /// once the server notices
     ServiceDown { name: String },
 }
 
-/// Sends visitors of a service to its client
+/// Sends visitors of a service to its client, each over its own data channel
 #[derive(Clone, Debug)]
 pub struct VisitorSender {
     data_ch_req_tx: mpsc::UnboundedSender<bool>, // Requests a data channel for the visitor
-    visitor_tx: mpsc::Sender<DataChannelStream>, // Sends the visitor to the connection pool
+    visitor_tx: mpsc::Sender<BoxedStream>,       // Sends the visitor to the connection pool
 }
 
 impl VisitorSender {
-    /// Forward `visitor` to the client. Waits while the visitor queue is full,
-    /// and returns the visitor if the control channel is gone
-    pub async fn send(
-        &self,
-        visitor: DataChannelStream,
-    ) -> std::result::Result<(), DataChannelStream> {
+    /// Forward `visitor` to the client over a new data channel. Waits while
+    /// the visitor queue is full, and returns the visitor if the control
+    /// channel is gone
+    pub async fn send(&self, visitor: BoxedStream) -> std::result::Result<(), BoxedStream> {
         // For every visitor, request to create a data channel
         if self.data_ch_req_tx.send(true).is_err() {
             // An error indicates the control channel is broken
@@ -92,11 +91,11 @@ pub async fn run_server(
     update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let server = run_server_streams(config, shutdown_rx, update_rx, events_tx);
+    let server = run_server_with_events(config, shutdown_rx, update_rx, events_tx);
     tokio::pin!(server);
 
-    // Listen at the `bind_addr` of each TCP service while its client is
-    // connected. Dropping the sender stops the listener
+    // Listen for visitors at the `bind_addr` of each TCP service while its
+    // control channel is up. Dropping the sender stops the listener
     let mut listeners = HashMap::new();
     loop {
         tokio::select! {
@@ -120,7 +119,7 @@ pub async fn run_server(
 /// are taken from the `VisitorSender` reported in `events`, until
 /// `shutdown_rx` fires. UDP services listen at their `bind_addr` as usual, and
 /// produce no events.
-pub async fn run_server_streams(
+pub async fn run_server_with_events(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
@@ -621,7 +620,7 @@ where
 struct ControlChannel<T: Transport> {
     conn: T::Stream,                               // The connection of control channel
     shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
-    data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
+    data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives requests for data channels
     heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
 }
 
@@ -753,7 +752,7 @@ fn tcp_listen_and_send(
 
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<T: Transport>(
-    mut visitor_rx: mpsc::Receiver<DataChannelStream>,
+    mut visitor_rx: mpsc::Receiver<BoxedStream>,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,

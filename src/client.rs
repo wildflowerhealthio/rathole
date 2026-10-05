@@ -1,6 +1,6 @@
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
-use crate::helper::{udp_connect, DataChannelStream};
+use crate::helper::{udp_connect, BoxedStream};
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
@@ -30,21 +30,23 @@ use crate::transport::WebsocketTransport;
 
 use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
 
-// The capacity of the channel of each service's data channels
-const STREAM_CHAN_SIZE: usize = 32;
+// How many data channels of a service can wait to be taken
+const DATA_CH_QUEUE_SIZE: usize = 32;
 
 /// A change in the TCP services whose data channels are taken by
-/// `run_client_streams`'s caller
+/// `run_client_with_events`'s caller
 #[derive(Debug)]
 pub enum ClientEvent {
-    /// The service started. Each of its data channels, after the server has
-    /// asked to forward a visitor, is sent on `streams`, for the caller to
-    /// serve in place of `local_addr`
+    /// The service started, and its control channel is connecting to the
+    /// server. Each of its data channels that the server sends
+    /// `StartForwardTcp` on carries one visitor, and is sent on
+    /// `data_channels` for the caller to serve in place of a local connection
+    /// to `local_addr`
     ServiceUp {
         config: ClientServiceConfig,
-        streams: mpsc::Receiver<DataChannelStream>,
+        data_channels: mpsc::Receiver<BoxedStream>,
     },
-    /// The service stopped. Its `streams` ends once the data channels
+    /// The service stopped. Its `data_channels` ends once the data channels
     /// already opened are sent
     ServiceDown { name: String },
 }
@@ -57,27 +59,33 @@ pub async fn run_client(
 ) -> Result<()> {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
-    // Connect each data channel to the service's `local_addr`. The events end
+    // Make a local connection to `local_addr` for each data channel. The events end
     // once the client has stopped every service
     let forward = async move {
         while let Some(event) = events_rx.recv().await {
-            if let ClientEvent::ServiceUp { config, streams } = event {
+            if let ClientEvent::ServiceUp {
+                config,
+                data_channels,
+            } = event
+            {
                 let span = info_span!("handle", service = %config.name);
-                tokio::spawn(forward_to_local_addr(config.local_addr, streams).instrument(span));
+                tokio::spawn(
+                    forward_to_local_addr(config.local_addr, data_channels).instrument(span),
+                );
             }
         }
     };
 
     let (ret, _) = tokio::join!(
-        run_client_streams(config, shutdown_rx, update_rx, events_tx),
+        run_client_with_events(config, shutdown_rx, update_rx, events_tx),
         forward
     );
     ret
 }
 
-// Connect each data channel received to `local_addr`
-async fn forward_to_local_addr(local_addr: String, mut streams: mpsc::Receiver<DataChannelStream>) {
-    while let Some(conn) = streams.recv().await {
+// Forward each data channel received over a local connection to `local_addr`
+async fn forward_to_local_addr(local_addr: String, mut data_channels: mpsc::Receiver<BoxedStream>) {
+    while let Some(conn) = data_channels.recv().await {
         let local_addr = local_addr.clone();
         tokio::spawn(
             async move {
@@ -93,10 +101,11 @@ async fn forward_to_local_addr(local_addr: String, mut streams: mpsc::Receiver<D
     }
 }
 
-/// Run a client that connects to no local address. The data channels of each
-/// TCP service are sent to `events`, until `shutdown_rx` fires. UDP services
-/// are forwarded to their `local_addr` as usual, and produce no events.
-pub async fn run_client_streams(
+/// Run a client that makes no local connections for TCP services. Instead the
+/// data channels of each TCP service are reported in `events`, until
+/// `shutdown_rx` fires. UDP services are forwarded to their `local_addr` as
+/// usual, and produce no events.
+pub async fn run_client_with_events(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
@@ -249,7 +258,7 @@ struct RunDataChannelArgs<T: Transport> {
     connector: Arc<T>,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
-    streams: mpsc::Sender<DataChannelStream>,
+    data_channels: mpsc::Sender<BoxedStream>,
 }
 
 async fn do_data_channel_handshake<T: Transport>(
@@ -299,9 +308,10 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
-            // Hand the data channel to whoever serves the service. Waits while
-            // the service's data channels are not being taken
-            args.streams
+            // Hand the data channel, now carrying a visitor, to whoever serves
+            // the service. Waits while the service's data channels are not
+            // being taken
+            args.data_channels
                 .send(Box::new(conn))
                 .await
                 .map_err(|_| anyhow!("The service is stopped"))?;
@@ -318,7 +328,7 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
 
 // Simply copying back and forth for TCP
 #[instrument(skip(conn))]
-async fn run_data_channel_for_tcp(mut conn: DataChannelStream, local_addr: &str) -> Result<()> {
+async fn run_data_channel_for_tcp(mut conn: BoxedStream, local_addr: &str) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let mut local = TcpStream::connect(local_addr)
@@ -472,8 +482,8 @@ struct ControlChannel<T: Transport> {
     remote_addr: String,                // `client.remote_addr`
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
-    // Receives the TCP data channels
-    streams: mpsc::Sender<DataChannelStream>,
+    // Where the service's TCP data channels are sent once forwarding
+    data_channels: mpsc::Sender<BoxedStream>,
 }
 
 // Handle of a control channel
@@ -557,7 +567,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             connector: self.transport.clone(),
             socket_opts,
             service: self.service.clone(),
-            streams: self.streams.clone(),
+            data_channels: self.data_channels.clone(),
         });
 
         loop {
@@ -606,13 +616,14 @@ impl ControlChannelHandle {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         // Report a TCP service up, with where its data channels are sent.
-        // UDP data channels are forwarded here, so there is nothing to report
-        let (streams, streams_rx) = mpsc::channel(STREAM_CHAN_SIZE);
+        // UDP data channels still make their own local connection to
+        // `local_addr`, so there is nothing to report
+        let (data_channels, data_channels_rx) = mpsc::channel(DATA_CH_QUEUE_SIZE);
         let down = match service.service_type {
             ServiceType::Tcp => {
                 let _ = events.send(ClientEvent::ServiceUp {
                     config: service.clone(),
-                    streams: streams_rx,
+                    data_channels: data_channels_rx,
                 });
                 Some(ServiceDownGuard {
                     name: service.name.clone(),
@@ -631,7 +642,7 @@ impl ControlChannelHandle {
             remote_addr,
             transport,
             heartbeat_timeout,
-            streams,
+            data_channels,
         };
 
         tokio::spawn(
