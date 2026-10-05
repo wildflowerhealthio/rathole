@@ -68,7 +68,7 @@ pub async fn run_server(
 
     // Listen for visitors at the `bind_addr` of each TCP service while it is
     // connected. Dropping the sender stops the listener
-    let mut listeners = HashMap::new();
+    let mut listener_shutdown_txs = HashMap::new();
     loop {
         tokio::select! {
             ret = &mut server => break ret,
@@ -77,10 +77,10 @@ pub async fn run_server(
                     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
                     let span = info_span!("handle", service = %config.name);
                     span.in_scope(|| tcp_listen_and_send(config.bind_addr, visitor_tx, shutdown_rx));
-                    listeners.insert(config.name, shutdown_tx);
+                    listener_shutdown_txs.insert(config.name, shutdown_tx);
                 }
                 ServerServiceEvent::Disconnected { name } => {
-                    listeners.remove(&name);
+                    listener_shutdown_txs.remove(&name);
                 }
             }
         }
@@ -95,7 +95,7 @@ pub async fn run_server_with_visitor_queue(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
-    event_tx: mpsc::UnboundedSender<ServerServiceEvent>,
+    service_event_tx: mpsc::UnboundedSender<ServerServiceEvent>,
 ) -> Result<()> {
     let config = match config.server {
             Some(config) => config,
@@ -106,13 +106,13 @@ pub async fn run_server_with_visitor_queue(
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut server = Server::<TcpTransport>::from(config, event_tx).await?;
+            let mut server = Server::<TcpTransport>::from(config, service_event_tx).await?;
             server.run(shutdown_rx, update_rx).await?;
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut server = Server::<TlsTransport>::from(config, event_tx).await?;
+                let mut server = Server::<TlsTransport>::from(config, service_event_tx).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -121,7 +121,7 @@ pub async fn run_server_with_visitor_queue(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut server = Server::<NoiseTransport>::from(config, event_tx).await?;
+                let mut server = Server::<NoiseTransport>::from(config, service_event_tx).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(feature = "noise"))]
@@ -130,7 +130,8 @@ pub async fn run_server_with_visitor_queue(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut server = Server::<WebsocketTransport>::from(config, event_tx).await?;
+                let mut server =
+                    Server::<WebsocketTransport>::from(config, service_event_tx).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -157,7 +158,7 @@ struct Server<T: Transport> {
     // Wrapper around the transport layer
     transport: Arc<T>,
     // Where the TCP services connected and disconnected are reported
-    event_tx: mpsc::UnboundedSender<ServerServiceEvent>,
+    service_event_tx: mpsc::UnboundedSender<ServerServiceEvent>,
 }
 
 // Generate a hash map of services which is indexed by ServiceDigest
@@ -186,7 +187,7 @@ impl<T: 'static + Transport> Server<T> {
             services,
             control_channels,
             transport,
-            event_tx,
+            service_event_tx: event_tx,
         })
     }
 
@@ -247,7 +248,7 @@ impl<T: 'static + Transport> Server<T> {
                                             let services = self.services.clone();
                                             let control_channels = self.control_channels.clone();
                                             let server_config = self.config.clone();
-                                            let event_tx = self.event_tx.clone();
+                                            let event_tx = self.service_event_tx.clone();
                                             tokio::spawn(async move {
                                                 if let Err(err) = handle_connection(conn, services, control_channels, server_config, event_tx).await {
                                                     error!("{:#}", err);
