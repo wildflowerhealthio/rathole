@@ -677,77 +677,70 @@ fn tcp_listen_and_send(
     visitors: VisitorSender,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) {
-    tokio::spawn(
-        async move {
-            let l = retry_notify_with_deadline(
-                listen_backoff(),
-                || async { Ok(TcpListener::bind(&addr).await?) },
-                |e, duration| {
-                    error!("{:#}. Retry in {:?}", e, duration);
-                },
-                &mut shutdown_rx,
-            )
-            .await
-            .with_context(|| "Failed to listen for the service");
+    tokio::spawn(async move {
+        let l = retry_notify_with_deadline(listen_backoff(),  || async {
+            Ok(TcpListener::bind(&addr).await?)
+        }, |e, duration| {
+            error!("{:#}. Retry in {:?}", e, duration);
+        }, &mut shutdown_rx).await
+        .with_context(|| "Failed to listen for the service");
 
-            let l: TcpListener = match l {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("{:#}", e);
-                    return;
-                }
-            };
+        let l: TcpListener = match l {
+            Ok(v) => v,
+            Err(e) => {
+                error!("{:#}", e);
+                return;
+            }
+        };
 
-            info!("Listening at {}", &addr);
+        info!("Listening at {}", &addr);
 
-            // Retry at least every 1s
-            let mut backoff = ExponentialBackoff {
-                max_interval: Duration::from_secs(1),
-                max_elapsed_time: None,
-                ..Default::default()
-            };
+        // Retry at least every 1s
+        let mut backoff = ExponentialBackoff {
+            max_interval: Duration::from_secs(1),
+            max_elapsed_time: None,
+            ..Default::default()
+        };
 
-            // Wait for visitors and the shutdown signal
-            loop {
-                tokio::select! {
-                    val = l.accept() => {
-                        match val {
-                            Err(e) => {
-                                // `l` is a TCP listener so this must be a IO error
-                                // Possibly a EMFILE. So sleep for a while
-                                error!("{}. Sleep for a while", e);
-                                if let Some(d) = backoff.next_backoff() {
-                                    time::sleep(d).await;
-                                } else {
-                                    // This branch will never be reached for current backoff policy
-                                    error!("Too many retries. Aborting...");
-                                    break;
-                                }
-                            }
-                            Ok((incoming, addr)) => {
-                                backoff.reset();
-
-                                debug!("New visitor from {}", addr);
-
-                                // Send the visitor to the client
-                                if visitors.send(Box::new(incoming)).await.is_err() {
-                                    // An error indicates the control channel is broken
-                                    // So break the loop
-                                    break;
-                                }
+        // Wait for visitors and the shutdown signal
+        loop {
+            tokio::select! {
+                val = l.accept() => {
+                    match val {
+                        Err(e) => {
+                            // `l` is a TCP listener so this must be a IO error
+                            // Possibly a EMFILE. So sleep for a while
+                            error!("{}. Sleep for a while", e);
+                            if let Some(d) = backoff.next_backoff() {
+                                time::sleep(d).await;
+                            } else {
+                                // This branch will never be reached for current backoff policy
+                                error!("Too many retries. Aborting...");
+                                break;
                             }
                         }
-                    },
-                    _ = shutdown_rx.recv() => {
-                        break;
+                        Ok((incoming, addr)) => {
+                            backoff.reset();
+
+                            debug!("New visitor from {}", addr);
+
+                            // Send the visitor to the client
+                            if visitors.send(Box::new(incoming)).await.is_err() {
+                                // An error indicates the control channel is broken
+                                // So break the loop
+                                break;
+                            }
+                        }
                     }
+                },
+                _ = shutdown_rx.recv() => {
+                    break;
                 }
             }
-
-            info!("TCPListener shutdown");
         }
-        .instrument(Span::current()),
-    );
+
+        info!("TCPListener shutdown");
+    }.instrument(Span::current()));
 }
 
 #[instrument(skip_all)]

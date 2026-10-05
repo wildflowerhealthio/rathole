@@ -70,6 +70,7 @@ pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
 
 /// Create a UDP socket and connect to `addr`
 pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result<UdpSocket> {
+
     let (socket_addr, bind_addr);
 
     match prefer_ipv6 {
@@ -80,7 +81,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
                 SocketAddr::V4(_) => "0.0.0.0:0",
                 SocketAddr::V6(_) => ":::0",
             };
-        }
+        },
         true => {
             let all_host_addresses: Vec<SocketAddr> = lookup_host(addr).await?.collect();
 
@@ -89,7 +90,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
                 Some(socket_addr_ipv6) => {
                     socket_addr = *socket_addr_ipv6;
                     bind_addr = ":::0";
-                }
+                },
                 None => {
                     let socket_addr_ipv4 = all_host_addresses.iter().find(|x| x.is_ipv4());
                     match socket_addr_ipv4 {
