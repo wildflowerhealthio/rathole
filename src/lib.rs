@@ -26,7 +26,7 @@ pub use client::{run_client, run_client_streams, ClientEvent};
 #[cfg(feature = "server")]
 mod server;
 #[cfg(feature = "server")]
-pub use server::run_server;
+pub use server::{run_server, run_server_streams, ServerEvent, VisitorSender};
 
 use crate::config_watcher::ConfigWatcherHandle;
 
