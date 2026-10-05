@@ -1,338 +1,442 @@
 #![cfg(all(feature = "client", feature = "server"))]
 
-use anyhow::{Context, Result};
-use rathole::{ClientEvent, Config, ConfigChange, ServerEvent, ServerServiceChange};
-use std::future::Future;
+use anyhow::{Ok, Result};
+use common::{PING, PONG};
+use rand::Rng;
+use rathole::{BoxedStream, ClientEvent, Config, ServerEvent, ServiceType, VisitorSender};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::{broadcast, mpsc},
     time,
 };
+use tracing::{debug, info, instrument};
+use tracing_subscriber::EnvFilter;
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+#[allow(dead_code)]
+mod common;
 
-// An address on loopback with a port that is free, for now
-async fn free_addr() -> Result<String> {
-    let l = TcpListener::bind("127.0.0.1:0").await?;
-    Ok(l.local_addr()?.to_string())
+const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
+const PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8081";
+const ECHO_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2334";
+const PINGPONG_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2335";
+const HITTER_NUM: usize = 4;
+
+#[derive(Clone, Copy, Debug)]
+enum Type {
+    Tcp,
+    Udp,
 }
 
-// A server with the TCP service `echo` exposed at `echo_addr`, and the UDP
-// service `dns`
-fn server_config(bind_addr: &str, echo_addr: &str, dns_addr: &str) -> Result<Config> {
-    format!(
-        r#"
-        [server]
-        bind_addr = "{bind_addr}"
-
-        [server.services.echo]
-        bind_addr = "{echo_addr}"
-        token = "echo_token"
-
-        [server.services.dns]
-        type = "udp"
-        bind_addr = "{dns_addr}"
-        token = "dns_token"
-    "#
-    )
-    .parse()
+fn init() {
+    let level = "info";
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from(level)),
+        )
+        .try_init();
 }
 
-// A client of the TCP service `echo`, served at `echo_addr`, and the UDP
-// service `dns`
-fn client_config(remote_addr: &str, echo_addr: &str) -> Result<Config> {
-    format!(
-        r#"
-        [client]
-        remote_addr = "{remote_addr}"
+#[tokio::test]
+async fn tcp() -> Result<()> {
+    init();
 
-        [client.services.echo]
-        local_addr = "{echo_addr}"
-        token = "echo_token"
+    // The client serves the echo and pingpong services from their data channels
 
-        [client.services.dns]
-        type = "udp"
-        local_addr = "127.0.0.1:53"
-        token = "dns_token"
-    "#
-    )
-    .parse()
-}
+    test("tests/for_tcp/tcp_transport.toml", Type::Tcp).await?;
 
-// Echo everything read from `stream`
-fn spawn_echo<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) {
-    tokio::spawn(async move {
-        let (mut rd, mut wr) = tokio::io::split(stream);
-        let _ = tokio::io::copy(&mut rd, &mut wr).await;
-    });
-}
+    #[cfg(any(
+         // FIXME: Self-signed certificate on macOS nativetls requires manual interference.
+         all(target_os = "macos", feature = "rustls"),
+         // On other OS accept run with either
+         all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
+     ))]
+    test("tests/for_tcp/tls_transport.toml", Type::Tcp).await?;
 
-// Send `ping` over `stream` and expect it back
-async fn ping<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
-    stream.write_all(b"ping").await?;
-    let mut rd = [0u8; 4];
-    time::timeout(TIMEOUT, stream.read_exact(&mut rd))
-        .await
-        .context("Not echoed")??;
-    assert_eq!(&rd, b"ping");
+    #[cfg(feature = "noise")]
+    test("tests/for_tcp/noise_transport.toml", Type::Tcp).await?;
+
+    #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+    test("tests/for_tcp/websocket_transport.toml", Type::Tcp).await?;
+
+    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+    test("tests/for_tcp/websocket_tls_transport.toml", Type::Tcp).await?;
+
     Ok(())
 }
 
-// Visit `addr` until it echoes, as it is not listened at until the client
-// connects
-async fn ping_addr(addr: &str) -> Result<()> {
-    time::timeout(TIMEOUT, async {
-        loop {
-            if let Ok(mut conn) = TcpStream::connect(addr).await {
-                if ping(&mut conn).await.is_ok() {
-                    return;
+#[tokio::test]
+async fn udp() -> Result<()> {
+    init();
+
+    // Spawn a echo server
+    tokio::spawn(async move {
+        if let Err(e) = common::udp::echo_server(ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the echo server for testing: {:?}", e);
+        }
+    });
+
+    // Spawn a pingpong server
+    tokio::spawn(async move {
+        if let Err(e) = common::udp::pingpong_server(PINGPONG_SERVER_ADDR).await {
+            panic!("Failed to run the pingpong server for testing: {:?}", e);
+        }
+    });
+
+    test("tests/for_udp/tcp_transport.toml", Type::Udp).await?;
+
+    #[cfg(any(
+         // FIXME: Self-signed certificate on macOS nativetls requires manual interference.
+         all(target_os = "macos", feature = "rustls"),
+         // On other OS accept run with either
+         all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
+     ))]
+    test("tests/for_udp/tls_transport.toml", Type::Udp).await?;
+
+    #[cfg(feature = "noise")]
+    test("tests/for_udp/noise_transport.toml", Type::Udp).await?;
+
+    #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+    test("tests/for_udp/websocket_transport.toml", Type::Udp).await?;
+
+    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+    test("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
+
+    Ok(())
+}
+
+#[instrument]
+async fn test(config_path: &'static str, t: Type) -> Result<()> {
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        // Skip the test if the client or the server is not enabled
+        return Ok(());
+    }
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    // Start the client
+    info!("start the client");
+    let client = tokio::spawn(async move {
+        run_rathole_client(config_path, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    // Sleep for 1 second. Expect the client keep retrying to reach the server
+    time::sleep(Duration::from_secs(1)).await;
+
+    // Start the server
+    info!("start the server");
+    let server = tokio::spawn(async move {
+        run_rathole_server(config_path, server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
+
+    info!("echo");
+    echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
+    info!("pingpong");
+    pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t)
+        .await
+        .unwrap();
+
+    // Simulate the client crash and restart
+    info!("shutdown the client");
+    client_shutdown_tx.send(true)?;
+    tokio::join!(client).0?;
+
+    info!("restart the client");
+    let client_shutdown_rx = client_shutdown_tx.subscribe();
+    let client = tokio::spawn(async move {
+        run_rathole_client(config_path, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_secs(1)).await; // Wait for the client to start
+
+    info!("echo");
+    echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
+    info!("pingpong");
+    pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t)
+        .await
+        .unwrap();
+
+    // Simulate the server crash and restart
+    info!("shutdown the server");
+    server_shutdown_tx.send(true)?;
+    tokio::join!(server).0?;
+
+    info!("restart the server");
+    let server_shutdown_rx = server_shutdown_tx.subscribe();
+    let server = tokio::spawn(async move {
+        run_rathole_server(config_path, server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
+
+    // Simulate heavy load
+    info!("lots of echo and pingpong");
+
+    let mut v = Vec::new();
+
+    for _ in 0..HITTER_NUM / 2 {
+        v.push(tokio::spawn(async move {
+            echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
+        }));
+
+        v.push(tokio::spawn(async move {
+            pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t)
+                .await
+                .unwrap();
+        }));
+    }
+
+    for h in v {
+        assert!(tokio::join!(h).0.is_ok());
+    }
+
+    // Shutdown
+    info!("shutdown the server and the client");
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+
+    let (server, client) = tokio::join!(server, client);
+    server?;
+    client?;
+
+    Ok(())
+}
+
+// Run a client that serves the data channels of each TCP service as tests/common
+// serves the service. Each service that comes up goes down by the end, and only
+// TCP services come up
+async fn run_rathole_client(
+    config_path: &str,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    let config = Config::from_file(Path::new(config_path)).await?;
+    let (client_events_tx, mut client_events_rx) = mpsc::unbounded_channel();
+    let (_, config_change_rx) = mpsc::channel(1);
+    let client =
+        rathole::run_client_with_events(config, shutdown_rx, config_change_rx, client_events_tx);
+
+    let mut up_service_names = Vec::new();
+    let client_event_handler = async {
+        while let Some(e) = client_events_rx.recv().await {
+            match e {
+                ClientEvent::ServiceUp {
+                    config,
+                    mut data_channels,
+                } => {
+                    assert_eq!(config.service_type, ServiceType::Tcp);
+                    assert!(
+                        !up_service_names.contains(&config.name),
+                        "{} is up twice",
+                        config.name
+                    );
+                    up_service_names.push(config.name.clone());
+                    tokio::spawn(async move {
+                        while let Some(data_channel) = data_channels.recv().await {
+                            serve(&config.name, data_channel);
+                        }
+                    });
+                }
+                ClientEvent::ServiceDown {
+                    name: downing_service_name,
+                } => {
+                    assert!(
+                        up_service_names.contains(&downing_service_name),
+                        "{} received down event but not up",
+                        downing_service_name
+                    );
+                    up_service_names.retain(|n| *n != downing_service_name);
                 }
             }
-            time::sleep(Duration::from_millis(100)).await;
         }
-    })
-    .await
-    .context("The visitor was never echoed")
-}
-
-async fn recv<T>(events: &mut mpsc::UnboundedReceiver<T>) -> Result<T> {
-    time::timeout(TIMEOUT, events.recv())
-        .await
-        .context("No event")?
-        .context("The events ended")
-}
-
-// Assert no event comes within a while
-async fn assert_no_event<T: std::fmt::Debug>(events: &mut mpsc::UnboundedReceiver<T>) {
-    if let Ok(Some(e)) = time::timeout(Duration::from_millis(500), events.recv()).await {
-        panic!("Unexpected event {:?}", e);
-    }
-}
-
-// Run `f` with its own shutdown channel and no config changes
-fn spawn_instance<F, Fut>(f: F) -> (broadcast::Sender<bool>, tokio::task::JoinHandle<Result<()>>)
-where
-    F: FnOnce(broadcast::Receiver<bool>, mpsc::Receiver<ConfigChange>) -> Fut,
-    Fut: Future<Output = Result<()>> + Send + 'static,
-{
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let (update_tx, update_rx) = mpsc::channel(1);
-    let task = f(shutdown_rx, update_rx);
-    (
-        shutdown_tx,
-        tokio::spawn(async move {
-            let _update_tx = update_tx;
-            task.await
-        }),
-    )
-}
-
-#[tokio::test]
-async fn client_streams() -> Result<()> {
-    let (bind_addr, echo_addr, dns_addr) =
-        (free_addr().await?, free_addr().await?, free_addr().await?);
-    let (server_shutdown_tx, server) = spawn_instance(|s, u| {
-        rathole::run_server(
-            server_config(&bind_addr, &echo_addr, &dns_addr).unwrap(),
-            s,
-            u,
-        )
-    });
-
-    // `local_addr` is not connected to
-    let (events_tx, mut events) = mpsc::unbounded_channel();
-    let config = client_config(&bind_addr, "127.0.0.1:1")?;
-    let (client_shutdown_tx, client) =
-        spawn_instance(|s, u| rathole::run_client_streams(config, s, u, events_tx));
-
-    // Only the TCP service is reported
-    let mut streams = match recv(&mut events).await? {
-        ClientEvent::ServiceUp { config, streams } => {
-            assert_eq!(config.name, "echo");
-            streams
-        }
-        e => panic!("Unexpected event {:?}", e),
     };
-    tokio::spawn(async move {
-        while let Some(stream) = streams.recv().await {
-            spawn_echo(stream);
-        }
-    });
 
-    // A visitor at the server reaches the stream
-    ping_addr(&echo_addr).await?;
-    assert_no_event(&mut events).await;
-
-    client_shutdown_tx.send(true)?;
-    client.await??;
-    match recv(&mut events).await? {
-        ClientEvent::ServiceDown { name } => assert_eq!(name, "echo"),
-        e => panic!("Unexpected event {:?}", e),
-    }
-    assert!(events.recv().await.is_none());
-
-    server_shutdown_tx.send(true)?;
-    server.await??;
+    let (ret, _) = tokio::join!(client, client_event_handler);
+    ret?;
+    assert!(
+        up_service_names.is_empty(),
+        "{:?} are never down",
+        up_service_names
+    );
     Ok(())
 }
 
-#[tokio::test]
-async fn local_addr_forwarding() -> Result<()> {
-    let (bind_addr, echo_addr, dns_addr) =
-        (free_addr().await?, free_addr().await?, free_addr().await?);
-
-    let local = TcpListener::bind("127.0.0.1:0").await?;
-    let local_addr = local.local_addr()?.to_string();
-    tokio::spawn(async move {
-        while let Ok((conn, _)) = local.accept().await {
-            spawn_echo(conn);
-        }
-    });
-
-    let (server_shutdown_tx, server) = spawn_instance(|s, u| {
-        rathole::run_server(
-            server_config(&bind_addr, &echo_addr, &dns_addr).unwrap(),
-            s,
-            u,
-        )
-    });
-    let config = client_config(&bind_addr, &local_addr)?;
-    let (client_shutdown_tx, client) = spawn_instance(|s, u| rathole::run_client(config, s, u));
-
-    ping_addr(&echo_addr).await?;
-    // Several visitors at once
-    let mut visitors = Vec::new();
-    for _ in 0..4 {
-        visitors.push(TcpStream::connect(&echo_addr).await?);
-    }
-    for v in &mut visitors {
-        ping(v).await?;
-    }
-
-    client_shutdown_tx.send(true)?;
-    server_shutdown_tx.send(true)?;
-    client.await??;
-    server.await??;
-    Ok(())
+// Serve `data_channel` as tests/common serves the TCP service `name`
+fn serve(name: &str, data_channel: BoxedStream) {
+    match name {
+        "echo" => tokio::spawn(async move {
+            let (mut rd, mut wr) = tokio::io::split(data_channel);
+            let _ = tokio::io::copy(&mut rd, &mut wr).await;
+        }),
+        "pingpong" => tokio::spawn(async move {
+            let mut data_channel = data_channel;
+            let mut buf = [0u8; PING.len()];
+            while data_channel.read_exact(&mut buf).await.is_ok() {
+                assert_eq!(buf, PING.as_bytes());
+                if data_channel.write_all(PONG.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        }),
+        _ => panic!("Unexpected service {}", name),
+    };
 }
 
-// Run a client of `remote_addr` that echoes every data channel of `echo`
-fn spawn_echo_client(
-    remote_addr: &str,
-) -> Result<(broadcast::Sender<bool>, tokio::task::JoinHandle<Result<()>>)> {
-    let config = client_config(remote_addr, "127.0.0.1:1")?;
-    let (events_tx, mut events) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while let Some(e) = events.recv().await {
-            if let ClientEvent::ServiceUp { mut streams, .. } = e {
-                tokio::spawn(async move {
-                    while let Some(stream) = streams.recv().await {
-                        spawn_echo(stream);
-                    }
-                });
+// Run a server that accepts the visitors of each TCP service at its
+// `bind_addr` itself, and sends them to the client of the service while it is
+// up. Each service that comes up goes down by the end, and only TCP services
+// come up
+async fn run_rathole_server(
+    config_path: &str,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    let config = Config::from_file(Path::new(config_path)).await?;
+    let (server_events_tx, mut server_events_rx) = mpsc::unbounded_channel();
+    let (_, config_change_rx) = mpsc::channel(1);
+
+    let up_visitor_senders = Arc::new(Mutex::new(HashMap::<String, VisitorSender>::new()));
+    let mut listeners = Vec::new();
+    for service in config.server.as_ref().unwrap().services.values() {
+        if service.service_type != ServiceType::Tcp {
+            continue;
+        }
+        let tcp_listener = TcpListener::bind(&service.bind_addr).await?;
+        let (name, up) = (service.name.clone(), up_visitor_senders.clone());
+        listeners.push(tokio::spawn(async move {
+            while let std::result::Result::Ok((conn, _)) = tcp_listener.accept().await {
+                let visitors = up.lock().unwrap().get(&name).cloned();
+                if let Some(visitor_sender) = visitors {
+                    let _ = visitor_sender.send(Box::new(conn)).await;
+                }
+            }
+        }));
+    }
+
+    let server =
+        rathole::run_server_with_events(config, shutdown_rx, config_change_rx, server_events_tx);
+    let track = async {
+        while let Some(e) = server_events_rx.recv().await {
+            match e {
+                ServerEvent::ServiceUp { config, visitors } => {
+                    assert_eq!(config.service_type, ServiceType::Tcp);
+                    let old = up_visitor_senders
+                        .lock()
+                        .unwrap()
+                        .insert(config.name.clone(), visitors);
+                    assert!(old.is_none(), "{} is up twice", config.name);
+                }
+                ServerEvent::ServiceDown { name } => {
+                    let old = up_visitor_senders.lock().unwrap().remove(&name);
+                    assert!(old.is_some(), "{} is down but not up", name);
+                }
             }
         }
-    });
-    Ok(spawn_instance(|s, u| {
-        rathole::run_client_streams(config, s, u, events_tx)
-    }))
+    };
+
+    let (ret, _) = tokio::join!(server, track);
+    for l in listeners {
+        l.abort();
+        let _ = l.await;
+    }
+    ret?;
+    let up = up_visitor_senders.lock().unwrap();
+    assert!(up.is_empty(), "{:?} are never down", up.keys());
+    Ok(())
 }
 
-// Expect `ServiceUp` of `echo`, returning its visitor sender
-async fn recv_echo_up(
-    events: &mut mpsc::UnboundedReceiver<ServerEvent>,
-) -> Result<rathole::VisitorSender> {
-    match recv(events).await? {
-        ServerEvent::ServiceUp { config, visitors } => {
-            assert_eq!(config.name, "echo");
-            Ok(visitors)
-        }
-        e => panic!("Unexpected event {:?}", e),
+async fn echo_hitter(addr: &'static str, t: Type) -> Result<()> {
+    match t {
+        Type::Tcp => tcp_echo_hitter(addr).await,
+        Type::Udp => udp_echo_hitter(addr).await,
     }
 }
 
-async fn recv_echo_down(events: &mut mpsc::UnboundedReceiver<ServerEvent>) -> Result<()> {
-    match recv(events).await? {
-        ServerEvent::ServiceDown { name } => assert_eq!(name, "echo"),
-        e => panic!("Unexpected event {:?}", e),
+async fn pingpong_hitter(addr: &'static str, t: Type) -> Result<()> {
+    match t {
+        Type::Tcp => tcp_pingpong_hitter(addr).await,
+        Type::Udp => udp_pingpong_hitter(addr).await,
+    }
+}
+
+async fn tcp_echo_hitter(addr: &'static str) -> Result<()> {
+    let mut conn = TcpStream::connect(addr).await?;
+
+    let mut wr = [0u8; 1024];
+    let mut rd = [0u8; 1024];
+    for _ in 0..100 {
+        rand::thread_rng().fill(&mut wr);
+        conn.write_all(&wr).await?;
+        conn.read_exact(&mut rd).await?;
+        assert_eq!(wr, rd);
+    }
+
+    Ok(())
+}
+
+async fn udp_echo_hitter(addr: &'static str) -> Result<()> {
+    let conn = UdpSocket::bind("127.0.0.1:0").await?;
+    conn.connect(addr).await?;
+
+    let mut wr = [0u8; 128];
+    let mut rd = [0u8; 128];
+    for _ in 0..3 {
+        rand::thread_rng().fill(&mut wr);
+
+        conn.send(&wr).await?;
+        debug!("send");
+
+        conn.recv(&mut rd).await?;
+        debug!("recv");
+
+        assert_eq!(wr, rd);
     }
     Ok(())
 }
 
-// Send a visitor to the client and expect it to be echoed
-async fn ping_visitors(visitors: &rathole::VisitorSender) -> Result<()> {
-    let (mut visitor, stream) = tokio::io::duplex(1024);
-    visitors
-        .send(Box::new(stream))
-        .await
-        .map_err(|_| anyhow::anyhow!("The visitor was not taken"))?;
-    ping(&mut visitor).await
-}
+async fn tcp_pingpong_hitter(addr: &'static str) -> Result<()> {
+    let mut conn = TcpStream::connect(addr).await?;
 
-// Wait until the control channel behind `visitors` is gone
-async fn wait_closed(visitors: &rathole::VisitorSender) -> Result<()> {
-    time::timeout(TIMEOUT, async {
-        while !visitors.is_closed() {
-            time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .context("The visitor sender was never closed")?;
-    let (_visitor, stream) = tokio::io::duplex(1024);
-    assert!(visitors.send(Box::new(stream)).await.is_err());
+    let wr = PING.as_bytes();
+    let mut rd = [0u8; PONG.len()];
+
+    for _ in 0..100 {
+        conn.write_all(wr).await?;
+        conn.read_exact(&mut rd).await?;
+        assert_eq!(rd, PONG.as_bytes());
+    }
+
     Ok(())
 }
 
-#[tokio::test]
-async fn server_streams() -> Result<()> {
-    let (bind_addr, echo_addr, dns_addr) =
-        (free_addr().await?, free_addr().await?, free_addr().await?);
-    let (events_tx, mut events) = mpsc::unbounded_channel();
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let (update_tx, update_rx) = mpsc::channel(1);
-    let server = tokio::spawn(rathole::run_server_streams(
-        server_config(&bind_addr, &echo_addr, &dns_addr)?,
-        shutdown_rx,
-        update_rx,
-        events_tx,
-    ));
+async fn udp_pingpong_hitter(addr: &'static str) -> Result<()> {
+    let conn = UdpSocket::bind("127.0.0.1:0").await?;
+    conn.connect(&addr).await?;
 
-    // Nothing is up until the client connects
-    assert_no_event(&mut events).await;
+    let wr = PING.as_bytes();
+    let mut rd = [0u8; PONG.len()];
 
-    let (client_shutdown_tx, client) = spawn_echo_client(&bind_addr)?;
-    let visitors = recv_echo_up(&mut events).await?;
-    ping_visitors(&visitors).await?;
-    // `bind_addr` is not listened at
-    assert!(TcpStream::connect(&echo_addr).await.is_err());
+    for _ in 0..3 {
+        conn.send(wr).await?;
+        debug!("ping");
 
-    // The client reconnects. The old control channel is dropped before the new
-    // one is reported
-    client_shutdown_tx.send(true)?;
-    client.await??;
-    let (client_shutdown_tx, client) = spawn_echo_client(&bind_addr)?;
-    recv_echo_down(&mut events).await?;
-    wait_closed(&visitors).await?;
-    let visitors = recv_echo_up(&mut events).await?;
-    ping_visitors(&visitors).await?;
+        conn.recv(&mut rd).await?;
+        debug!("pong");
 
-    // Removing the service drops its control channel
-    update_tx
-        .send(ConfigChange::ServerChange(ServerServiceChange::Delete(
-            "echo".to_string(),
-        )))
-        .await?;
-    recv_echo_down(&mut events).await?;
-    wait_closed(&visitors).await?;
+        assert_eq!(rd, PONG.as_bytes());
+    }
 
-    // The UDP service is never reported
-    assert_no_event(&mut events).await;
-
-    client_shutdown_tx.send(true)?;
-    shutdown_tx.send(true)?;
-    client.await??;
-    server.await??;
     Ok(())
 }
