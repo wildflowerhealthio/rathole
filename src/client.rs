@@ -30,11 +30,10 @@ use crate::transport::WebsocketTransport;
 
 use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
 
-// How many visitor streams of a service can wait to be taken
-const VISITOR_STREAM_QUEUE_SIZE: usize = 32;
+const VISITOR_STREAM_QUEUE_SIZE: usize = 32; // The capacity of each service's visitor stream queue
 
 /// A change in the TCP services whose visitor streams are taken by
-/// `run_client_with_events`'s caller
+/// `run_client_with_visitor_queue`'s caller
 #[derive(Debug)]
 pub enum ClientServiceEvent {
     /// The service started, and its control channel is connecting to the
@@ -61,7 +60,7 @@ pub async fn run_client(
 
     // Make a local connection to `local_addr` for each visitor stream. The events end
     // once the client has stopped every service
-    let forward = async move {
+    let local_forwarding_client_event_handler = async move {
         while let Some(event) = event_rx.recv().await {
             if let ClientServiceEvent::Started {
                 config,
@@ -70,21 +69,22 @@ pub async fn run_client(
             {
                 let span = info_span!("handle", service = %config.name);
                 tokio::spawn(
-                    forward_to_local_addr(config.local_addr, visitor_stream_rx).instrument(span),
+                    forward_received_streams_to_local_addr(config.local_addr, visitor_stream_rx)
+                        .instrument(span),
                 );
             }
         }
     };
 
     let (ret, _) = tokio::join!(
-        run_client_with_events(config, shutdown_rx, update_rx, event_tx),
-        forward
+        run_client_with_visitor_queue(config, shutdown_rx, update_rx, event_tx),
+        local_forwarding_client_event_handler
     );
     ret
 }
 
 // Forward each visitor stream received over a local connection to `local_addr`
-async fn forward_to_local_addr(
+async fn forward_received_streams_to_local_addr(
     local_addr: String,
     mut visitor_stream_rx: mpsc::Receiver<Box<dyn AsyncStream>>,
 ) {
@@ -104,11 +104,12 @@ async fn forward_to_local_addr(
     }
 }
 
-/// Run a client that makes no local connections for TCP services. Instead the
-/// visitor streams of each TCP service are reported in `event_tx`, until
-/// `shutdown_rx` fires. UDP services are forwarded to their `local_addr` as
-/// usual, and produce no events.
-pub async fn run_client_with_events(
+/// Run a client that makes no local connections for TCP services. Instead each
+/// TCP service reports a visitor queue in `event_tx`, and its visitor streams
+/// come out of the queue for the caller to serve, until `shutdown_rx` fires.
+/// UDP services are forwarded to their `local_addr` as usual, and produce no
+/// events.
+pub async fn run_client_with_visitor_queue(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
@@ -323,7 +324,8 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
+                .await?;
         }
     }
     Ok(())

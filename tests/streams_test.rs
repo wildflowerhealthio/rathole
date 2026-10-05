@@ -226,8 +226,12 @@ async fn run_rathole_client(
     let config = Config::from_file(Path::new(config_path)).await?;
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
     let (_, config_change_rx) = mpsc::channel(1);
-    let client =
-        rathole::run_client_with_events(config, shutdown_rx, config_change_rx, client_event_tx);
+    let client = rathole::run_client_with_visitor_queue(
+        config,
+        shutdown_rx,
+        config_change_rx,
+        client_event_tx,
+    );
 
     let mut up_service_names = Vec::new();
     let client_event_handler = async {
@@ -307,7 +311,8 @@ async fn run_rathole_server(
     let (server_event_tx, mut server_event_rx) = mpsc::unbounded_channel();
     let (_, config_change_rx) = mpsc::channel(1);
 
-    let up_visitor_txs = Arc::new(Mutex::new(HashMap::<String, mpsc::Sender<Box<dyn AsyncStream>>>::new()));
+    let up_visitor_txs: Arc<Mutex<HashMap<String, mpsc::Sender<Box<dyn AsyncStream>>>>> =
+        Arc::default();
     let mut listeners = Vec::new();
     for service in config.server.as_ref().unwrap().services.values() {
         if service.service_type != ServiceType::Tcp {
@@ -325,8 +330,12 @@ async fn run_rathole_server(
         }));
     }
 
-    let server =
-        rathole::run_server_with_events(config, shutdown_rx, config_change_rx, server_event_tx);
+    let server = rathole::run_server_with_visitor_queue(
+        config,
+        shutdown_rx,
+        config_change_rx,
+        server_event_tx,
+    );
     let track = async {
         while let Some(e) = server_event_rx.recv().await {
             match e {

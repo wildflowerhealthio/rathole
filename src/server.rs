@@ -39,7 +39,7 @@ const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
 /// A change in the TCP services whose visitors are sent by
-/// `run_server_with_events`'s caller
+/// `run_server_with_visitor_queue`'s caller
 #[derive(Debug)]
 pub enum ServerServiceEvent {
     /// The control channel of the service was established. Visitors sent on
@@ -63,7 +63,7 @@ pub async fn run_server(
     update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let server = run_server_with_events(config, shutdown_rx, update_rx, event_tx);
+    let server = run_server_with_visitor_queue(config, shutdown_rx, update_rx, event_tx);
     tokio::pin!(server);
 
     // Listen for visitors at the `bind_addr` of each TCP service while it is
@@ -87,11 +87,11 @@ pub async fn run_server(
     }
 }
 
-/// Run a server that binds no visitor listeners. Visitors of each TCP service
-/// are taken from the `visitor_tx` reported in `event_tx`, until
-/// `shutdown_rx` fires. UDP services listen at their `bind_addr` as usual, and
-/// produce no events.
-pub async fn run_server_with_events(
+/// Run a server that binds no visitor listeners. Instead each TCP service
+/// reports a visitor queue in `event_tx`, and the caller puts the service's
+/// visitors into the queue, until `shutdown_rx` fires. UDP services listen at
+/// their `bind_addr` as usual, and produce no events.
+pub async fn run_server_with_visitor_queue(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
