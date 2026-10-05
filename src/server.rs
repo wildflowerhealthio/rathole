@@ -43,48 +43,17 @@ const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 #[derive(Debug)]
 pub enum ServerServiceEvent {
     /// The control channel of the service was established. Visitors sent on
-    /// `visitor_tx` are forwarded to the client over data channels, in place of
-    /// those accepted at `bind_addr`
+    /// `visitor_tx` are forwarded to the client, each over its own data
+    /// channel, in place of those accepted at `bind_addr`
     Connected {
         config: ServerServiceConfig,
-        visitor_tx: VisitorStreamSender,
+        visitor_tx: mpsc::Sender<Box<dyn AsyncStream>>,
     },
     /// The service's control channel was replaced by a new one, or dropped
     /// as the service was removed or the server stopped. A service whose
     /// control channel dies stays connected until then, though its `visitor_tx`
-    /// fails once the server notices
+    /// closes once the server notices
     Disconnected { name: String },
-}
-
-/// Sends visitors of a service to its client, each over its own data channel
-#[derive(Clone, Debug)]
-pub struct VisitorStreamSender {
-    data_ch_req_tx: mpsc::UnboundedSender<bool>, // Requests a data channel for the visitor
-    visitor_tx: mpsc::Sender<Box<dyn AsyncStream>>, // Sends the visitor to the connection pool
-}
-
-impl VisitorStreamSender {
-    /// Forward `visitor` to the client over a new data channel. Waits while
-    /// the visitor queue is full, and returns the visitor if the control
-    /// channel is gone
-    pub async fn send(
-        &self,
-        visitor_stream: Box<dyn AsyncStream>,
-    ) -> std::result::Result<(), Box<dyn AsyncStream>> {
-        // For every visitor, request to create a data channel
-        if self.data_ch_req_tx.send(true).is_err() {
-            // An error indicates the control channel is broken
-            return Err(visitor_stream);
-        }
-
-        // Send the visitor to the connection pool
-        self.visitor_tx.send(visitor_stream).await.map_err(|e| e.0)
-    }
-
-    /// Whether the control channel is gone, so that `send` fails
-    pub fn is_closed(&self) -> bool {
-        self.data_ch_req_tx.is_closed() || self.visitor_tx.is_closed()
-    }
 }
 
 // The entrypoint of running a server
@@ -119,7 +88,7 @@ pub async fn run_server(
 }
 
 /// Run a server that binds no visitor listeners. Visitors of each TCP service
-/// are taken from the `VisitorStreamSender` reported in `event_tx`, until
+/// are taken from the `visitor_tx` reported in `event_tx`, until
 /// `shutdown_rx` fires. UDP services listen at their `bind_addr` as usual, and
 /// produce no events.
 pub async fn run_server_with_events(
@@ -541,14 +510,16 @@ where
         // Report a TCP service connected, with where its visitors are sent. A UDP
         // service listens at `bind_addr` itself, so there is nothing to report
         let (visitor_tx, visitor_rx) = mpsc::channel(CHAN_SIZE);
+        let (pool_visitor_tx, pool_visitor_rx) = mpsc::channel(CHAN_SIZE);
         let event_tx = match service.service_type {
             ServiceType::Tcp => {
+                tokio::spawn(
+                    request_data_channels(visitor_rx, data_ch_req_tx.clone(), pool_visitor_tx)
+                        .instrument(Span::current()),
+                );
                 let _ = event_tx.send(ServerServiceEvent::Connected {
                     config: service.clone(),
-                    visitor_tx: VisitorStreamSender {
-                        data_ch_req_tx: data_ch_req_tx.clone(),
-                        visitor_tx,
-                    },
+                    visitor_tx,
                 });
                 Some(event_tx)
             }
@@ -561,7 +532,7 @@ where
             ServiceType::Tcp => tokio::spawn(
                 async move {
                     if let Err(e) = run_tcp_connection_pool::<T>(
-                        visitor_rx,
+                        pool_visitor_rx,
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
@@ -677,7 +648,7 @@ impl<T: Transport> ControlChannel<T> {
 
 fn tcp_listen_and_send(
     addr: String,
-    visitor_tx: VisitorStreamSender,
+    visitor_tx: mpsc::Sender<Box<dyn AsyncStream>>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) {
     tokio::spawn(async move {
@@ -744,6 +715,31 @@ fn tcp_listen_and_send(
 
         info!("TCPListener shutdown");
     }.instrument(Span::current()));
+}
+
+// For every visitor, request to create a data channel, then send the visitor
+// to the connection pool. Stops once the control channel is gone
+async fn request_data_channels(
+    mut visitor_rx: mpsc::Receiver<Box<dyn AsyncStream>>,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    pool_visitor_tx: mpsc::Sender<Box<dyn AsyncStream>>,
+) {
+    loop {
+        let visitor = tokio::select! {
+            visitor = visitor_rx.recv() => match visitor {
+                Some(visitor) => visitor,
+                None => break,
+            },
+            _ = data_ch_req_tx.closed() => break,
+        };
+        if data_ch_req_tx.send(true).is_err() {
+            // An error indicates the control channel is broken
+            break;
+        }
+        if pool_visitor_tx.send(visitor).await.is_err() {
+            break;
+        }
+    }
 }
 
 #[instrument(skip_all)]

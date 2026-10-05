@@ -3,7 +3,7 @@
 use anyhow::{Ok, Result};
 use common::{PING, PONG};
 use rand::Rng;
-use rathole::{AsyncStream, ClientServiceEvent, Config, ServerServiceEvent, ServiceType, VisitorStreamSender};
+use rathole::{AsyncStream, ClientServiceEvent, Config, ServerServiceEvent, ServiceType};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -307,7 +307,7 @@ async fn run_rathole_server(
     let (server_event_tx, mut server_event_rx) = mpsc::unbounded_channel();
     let (_, config_change_rx) = mpsc::channel(1);
 
-    let up_visitor_txs = Arc::new(Mutex::new(HashMap::<String, VisitorStreamSender>::new()));
+    let up_visitor_txs = Arc::new(Mutex::new(HashMap::<String, mpsc::Sender<Box<dyn AsyncStream>>>::new()));
     let mut listeners = Vec::new();
     for service in config.server.as_ref().unwrap().services.values() {
         if service.service_type != ServiceType::Tcp {
