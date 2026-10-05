@@ -21,12 +21,12 @@ use tracing::{debug, info};
 #[cfg(feature = "client")]
 mod client;
 #[cfg(feature = "client")]
-pub use client::{run_client, run_client_with_events, ClientEvent};
+pub use client::{run_client, run_client_with_events, ClientServiceEvent};
 
 #[cfg(feature = "server")]
 mod server;
 #[cfg(feature = "server")]
-pub use server::{run_server, run_server_with_events, ServerEvent, VisitorSender};
+pub use server::{run_server, run_server_with_events, ServerServiceEvent, VisitorStreamSender};
 
 use crate::config_watcher::ConfigWatcherHandle;
 

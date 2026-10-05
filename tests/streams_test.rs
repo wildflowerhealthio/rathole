@@ -3,7 +3,7 @@
 use anyhow::{Ok, Result};
 use common::{PING, PONG};
 use rand::Rng;
-use rathole::{AsyncStream, ClientEvent, Config, ServerEvent, ServiceType, VisitorSender};
+use rathole::{AsyncStream, ClientServiceEvent, Config, ServerServiceEvent, ServiceType, VisitorStreamSender};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -45,7 +45,7 @@ fn init() {
 async fn tcp() -> Result<()> {
     init();
 
-    // The client serves the echo and pingpong services from their data channels
+    // The client serves the echo and pingpong services from their visitor streams
 
     test("tests/for_tcp/tcp_transport.toml", Type::Tcp).await?;
 
@@ -216,46 +216,46 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     Ok(())
 }
 
-// Run a client that serves the data channels of each TCP service as tests/common
-// serves the service. Each service that comes up goes down by the end, and only
-// TCP services come up
+// Run a client that serves the visitor streams of each TCP service as tests/common
+// serves the service. Each service that starts stops by the end, and only TCP
+// services start
 async fn run_rathole_client(
     config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let config = Config::from_file(Path::new(config_path)).await?;
-    let (client_events_tx, mut client_events_rx) = mpsc::unbounded_channel();
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
     let (_, config_change_rx) = mpsc::channel(1);
     let client =
-        rathole::run_client_with_events(config, shutdown_rx, config_change_rx, client_events_tx);
+        rathole::run_client_with_events(config, shutdown_rx, config_change_rx, client_event_tx);
 
     let mut up_service_names = Vec::new();
     let client_event_handler = async {
-        while let Some(e) = client_events_rx.recv().await {
+        while let Some(e) = client_event_rx.recv().await {
             match e {
-                ClientEvent::ServiceUp {
+                ClientServiceEvent::Started {
                     config,
-                    mut data_channels,
+                    mut visitor_stream_rx,
                 } => {
                     assert_eq!(config.service_type, ServiceType::Tcp);
                     assert!(
                         !up_service_names.contains(&config.name),
-                        "{} is up twice",
+                        "{} started twice",
                         config.name
                     );
                     up_service_names.push(config.name.clone());
                     tokio::spawn(async move {
-                        while let Some(data_channel) = data_channels.recv().await {
-                            serve(&config.name, data_channel);
+                        while let Some(visitor_stream) = visitor_stream_rx.recv().await {
+                            serve(&config.name, visitor_stream);
                         }
                     });
                 }
-                ClientEvent::ServiceDown {
+                ClientServiceEvent::Stopped {
                     name: downing_service_name,
                 } => {
                     assert!(
                         up_service_names.contains(&downing_service_name),
-                        "{} received down event but not up",
+                        "{} stopped but never started",
                         downing_service_name
                     );
                     up_service_names.retain(|n| *n != downing_service_name);
@@ -268,25 +268,25 @@ async fn run_rathole_client(
     ret?;
     assert!(
         up_service_names.is_empty(),
-        "{:?} are never down",
+        "{:?} never stopped",
         up_service_names
     );
     Ok(())
 }
 
-// Serve `data_channel` as tests/common serves the TCP service `name`
-fn serve(name: &str, data_channel: Box<dyn AsyncStream>) {
+// Serve `visitor_stream` as tests/common serves the TCP service `name`
+fn serve(name: &str, visitor_stream: Box<dyn AsyncStream>) {
     match name {
         "echo" => tokio::spawn(async move {
-            let (mut rd, mut wr) = tokio::io::split(data_channel);
+            let (mut rd, mut wr) = tokio::io::split(visitor_stream);
             let _ = tokio::io::copy(&mut rd, &mut wr).await;
         }),
         "pingpong" => tokio::spawn(async move {
-            let mut data_channel = data_channel;
+            let mut visitor_stream = visitor_stream;
             let mut buf = [0u8; PING.len()];
-            while data_channel.read_exact(&mut buf).await.is_ok() {
+            while visitor_stream.read_exact(&mut buf).await.is_ok() {
                 assert_eq!(buf, PING.as_bytes());
-                if data_channel.write_all(PONG.as_bytes()).await.is_err() {
+                if visitor_stream.write_all(PONG.as_bytes()).await.is_err() {
                     break;
                 }
             }
@@ -297,50 +297,50 @@ fn serve(name: &str, data_channel: Box<dyn AsyncStream>) {
 
 // Run a server that accepts the visitors of each TCP service at its
 // `bind_addr` itself, and sends them to the client of the service while it is
-// up. Each service that comes up goes down by the end, and only TCP services
-// come up
+// connected. Each service that connects disconnects by the end, and only TCP
+// services connect
 async fn run_rathole_server(
     config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let config = Config::from_file(Path::new(config_path)).await?;
-    let (server_events_tx, mut server_events_rx) = mpsc::unbounded_channel();
+    let (server_event_tx, mut server_event_rx) = mpsc::unbounded_channel();
     let (_, config_change_rx) = mpsc::channel(1);
 
-    let up_visitor_senders = Arc::new(Mutex::new(HashMap::<String, VisitorSender>::new()));
+    let up_visitor_txs = Arc::new(Mutex::new(HashMap::<String, VisitorStreamSender>::new()));
     let mut listeners = Vec::new();
     for service in config.server.as_ref().unwrap().services.values() {
         if service.service_type != ServiceType::Tcp {
             continue;
         }
         let tcp_listener = TcpListener::bind(&service.bind_addr).await?;
-        let (name, up) = (service.name.clone(), up_visitor_senders.clone());
+        let (name, up) = (service.name.clone(), up_visitor_txs.clone());
         listeners.push(tokio::spawn(async move {
             while let std::result::Result::Ok((conn, _)) = tcp_listener.accept().await {
-                let visitors = up.lock().unwrap().get(&name).cloned();
-                if let Some(visitor_sender) = visitors {
-                    let _ = visitor_sender.send(Box::new(conn)).await;
+                let visitor_tx = up.lock().unwrap().get(&name).cloned();
+                if let Some(visitor_tx) = visitor_tx {
+                    let _ = visitor_tx.send(Box::new(conn)).await;
                 }
             }
         }));
     }
 
     let server =
-        rathole::run_server_with_events(config, shutdown_rx, config_change_rx, server_events_tx);
+        rathole::run_server_with_events(config, shutdown_rx, config_change_rx, server_event_tx);
     let track = async {
-        while let Some(e) = server_events_rx.recv().await {
+        while let Some(e) = server_event_rx.recv().await {
             match e {
-                ServerEvent::ServiceUp { config, visitors } => {
+                ServerServiceEvent::Connected { config, visitor_tx } => {
                     assert_eq!(config.service_type, ServiceType::Tcp);
-                    let old = up_visitor_senders
+                    let old = up_visitor_txs
                         .lock()
                         .unwrap()
-                        .insert(config.name.clone(), visitors);
-                    assert!(old.is_none(), "{} is up twice", config.name);
+                        .insert(config.name.clone(), visitor_tx);
+                    assert!(old.is_none(), "{} connected twice", config.name);
                 }
-                ServerEvent::ServiceDown { name } => {
-                    let old = up_visitor_senders.lock().unwrap().remove(&name);
-                    assert!(old.is_some(), "{} is down but not up", name);
+                ServerServiceEvent::Disconnected { name } => {
+                    let old = up_visitor_txs.lock().unwrap().remove(&name);
+                    assert!(old.is_some(), "{} disconnected but never connected", name);
                 }
             }
         }
@@ -352,8 +352,8 @@ async fn run_rathole_server(
         let _ = l.await;
     }
     ret?;
-    let up = up_visitor_senders.lock().unwrap();
-    assert!(up.is_empty(), "{:?} are never down", up.keys());
+    let up = up_visitor_txs.lock().unwrap();
+    assert!(up.is_empty(), "{:?} never disconnected", up.keys());
     Ok(())
 }
 

@@ -41,41 +41,44 @@ const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 /// A change in the TCP services whose visitors are sent by
 /// `run_server_with_events`'s caller
 #[derive(Debug)]
-pub enum ServerEvent {
+pub enum ServerServiceEvent {
     /// The control channel of the service was established. Visitors sent on
-    /// `visitors` are forwarded to the client over data channels, in place of
+    /// `visitor_tx` are forwarded to the client over data channels, in place of
     /// those accepted at `bind_addr`
-    ServiceUp {
+    Connected {
         config: ServerServiceConfig,
-        visitors: VisitorSender,
+        visitor_tx: VisitorStreamSender,
     },
     /// The service's control channel was replaced by a new one, or dropped
     /// as the service was removed or the server stopped. A service whose
-    /// control channel dies stays up until then, though its `visitors` fail
-    /// once the server notices
-    ServiceDown { name: String },
+    /// control channel dies stays connected until then, though its `visitor_tx`
+    /// fails once the server notices
+    Disconnected { name: String },
 }
 
 /// Sends visitors of a service to its client, each over its own data channel
 #[derive(Clone, Debug)]
-pub struct VisitorSender {
+pub struct VisitorStreamSender {
     data_ch_req_tx: mpsc::UnboundedSender<bool>, // Requests a data channel for the visitor
-    visitor_tx: mpsc::Sender<Box<dyn AsyncStream>>,       // Sends the visitor to the connection pool
+    visitor_tx: mpsc::Sender<Box<dyn AsyncStream>>, // Sends the visitor to the connection pool
 }
 
-impl VisitorSender {
+impl VisitorStreamSender {
     /// Forward `visitor` to the client over a new data channel. Waits while
     /// the visitor queue is full, and returns the visitor if the control
     /// channel is gone
-    pub async fn send(&self, visitor: Box<dyn AsyncStream>) -> std::result::Result<(), Box<dyn AsyncStream>> {
+    pub async fn send(
+        &self,
+        visitor_stream: Box<dyn AsyncStream>,
+    ) -> std::result::Result<(), Box<dyn AsyncStream>> {
         // For every visitor, request to create a data channel
         if self.data_ch_req_tx.send(true).is_err() {
             // An error indicates the control channel is broken
-            return Err(visitor);
+            return Err(visitor_stream);
         }
 
         // Send the visitor to the connection pool
-        self.visitor_tx.send(visitor).await.map_err(|e| e.0)
+        self.visitor_tx.send(visitor_stream).await.map_err(|e| e.0)
     }
 
     /// Whether the control channel is gone, so that `send` fails
@@ -90,24 +93,24 @@ pub async fn run_server(
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let server = run_server_with_events(config, shutdown_rx, update_rx, events_tx);
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let server = run_server_with_events(config, shutdown_rx, update_rx, event_tx);
     tokio::pin!(server);
 
-    // Listen for visitors at the `bind_addr` of each TCP service while its
-    // control channel is up. Dropping the sender stops the listener
+    // Listen for visitors at the `bind_addr` of each TCP service while it is
+    // connected. Dropping the sender stops the listener
     let mut listeners = HashMap::new();
     loop {
         tokio::select! {
             ret = &mut server => break ret,
-            Some(e) = events_rx.recv() => match e {
-                ServerEvent::ServiceUp { config, visitors } => {
+            Some(e) = event_rx.recv() => match e {
+                ServerServiceEvent::Connected { config, visitor_tx } => {
                     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
                     let span = info_span!("handle", service = %config.name);
-                    span.in_scope(|| tcp_listen_and_send(config.bind_addr, visitors, shutdown_rx));
+                    span.in_scope(|| tcp_listen_and_send(config.bind_addr, visitor_tx, shutdown_rx));
                     listeners.insert(config.name, shutdown_tx);
                 }
-                ServerEvent::ServiceDown { name } => {
+                ServerServiceEvent::Disconnected { name } => {
                     listeners.remove(&name);
                 }
             }
@@ -116,14 +119,14 @@ pub async fn run_server(
 }
 
 /// Run a server that binds no visitor listeners. Visitors of each TCP service
-/// are taken from the `VisitorSender` reported in `events`, until
+/// are taken from the `VisitorStreamSender` reported in `event_tx`, until
 /// `shutdown_rx` fires. UDP services listen at their `bind_addr` as usual, and
 /// produce no events.
 pub async fn run_server_with_events(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
-    events: mpsc::UnboundedSender<ServerEvent>,
+    event_tx: mpsc::UnboundedSender<ServerServiceEvent>,
 ) -> Result<()> {
     let config = match config.server {
             Some(config) => config,
@@ -134,13 +137,13 @@ pub async fn run_server_with_events(
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut server = Server::<TcpTransport>::from(config, events).await?;
+            let mut server = Server::<TcpTransport>::from(config, event_tx).await?;
             server.run(shutdown_rx, update_rx).await?;
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut server = Server::<TlsTransport>::from(config, events).await?;
+                let mut server = Server::<TlsTransport>::from(config, event_tx).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -149,7 +152,7 @@ pub async fn run_server_with_events(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut server = Server::<NoiseTransport>::from(config, events).await?;
+                let mut server = Server::<NoiseTransport>::from(config, event_tx).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(feature = "noise"))]
@@ -158,7 +161,7 @@ pub async fn run_server_with_events(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut server = Server::<WebsocketTransport>::from(config, events).await?;
+                let mut server = Server::<WebsocketTransport>::from(config, event_tx).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -184,8 +187,8 @@ struct Server<T: Transport> {
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     // Wrapper around the transport layer
     transport: Arc<T>,
-    // Receives the TCP services up and down
-    events: mpsc::UnboundedSender<ServerEvent>,
+    // Where the TCP services connected and disconnected are reported
+    event_tx: mpsc::UnboundedSender<ServerServiceEvent>,
 }
 
 // Generate a hash map of services which is indexed by ServiceDigest
@@ -203,7 +206,7 @@ impl<T: 'static + Transport> Server<T> {
     // Create a server from `[server]`
     pub async fn from(
         config: ServerConfig,
-        events: mpsc::UnboundedSender<ServerEvent>,
+        event_tx: mpsc::UnboundedSender<ServerServiceEvent>,
     ) -> Result<Server<T>> {
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
@@ -214,7 +217,7 @@ impl<T: 'static + Transport> Server<T> {
             services,
             control_channels,
             transport,
-            events,
+            event_tx,
         })
     }
 
@@ -275,9 +278,9 @@ impl<T: 'static + Transport> Server<T> {
                                             let services = self.services.clone();
                                             let control_channels = self.control_channels.clone();
                                             let server_config = self.config.clone();
-                                            let events = self.events.clone();
+                                            let event_tx = self.event_tx.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, events).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, event_tx).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -342,7 +345,7 @@ async fn handle_connection<T: 'static + Transport>(
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
-    events: mpsc::UnboundedSender<ServerEvent>,
+    event_tx: mpsc::UnboundedSender<ServerServiceEvent>,
 ) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;
@@ -354,7 +357,7 @@ async fn handle_connection<T: 'static + Transport>(
                 control_channels,
                 service_digest,
                 server_config,
-                events,
+                event_tx,
             )
             .await?;
         }
@@ -371,7 +374,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
-    events: mpsc::UnboundedSender<ServerEvent>,
+    event_tx: mpsc::UnboundedSender<ServerServiceEvent>,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
@@ -445,7 +448,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             conn,
             service_config,
             server_config.heartbeat_interval,
-            events,
+            event_tx,
         );
 
         // Insert the new handle
@@ -487,14 +490,14 @@ pub struct ControlChannelHandle<T: Transport> {
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<T::Stream>,
     service: ServerServiceConfig,
-    // Reports a TCP service down when dropped
-    events: Option<mpsc::UnboundedSender<ServerEvent>>,
+    // Reports a TCP service disconnected when dropped
+    event_tx: Option<mpsc::UnboundedSender<ServerServiceEvent>>,
 }
 
 impl<T: Transport> Drop for ControlChannelHandle<T> {
     fn drop(&mut self) {
-        if let Some(events) = &self.events {
-            let _ = events.send(ServerEvent::ServiceDown {
+        if let Some(event_tx) = &self.event_tx {
+            let _ = event_tx.send(ServerServiceEvent::Disconnected {
                 name: self.service.name.clone(),
             });
         }
@@ -512,7 +515,7 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
-        events: mpsc::UnboundedSender<ServerEvent>,
+        event_tx: mpsc::UnboundedSender<ServerServiceEvent>,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -535,19 +538,19 @@ where
             };
         }
 
-        // Report a TCP service up, with where its visitors are sent. A UDP
+        // Report a TCP service connected, with where its visitors are sent. A UDP
         // service listens at `bind_addr` itself, so there is nothing to report
         let (visitor_tx, visitor_rx) = mpsc::channel(CHAN_SIZE);
-        let events = match service.service_type {
+        let event_tx = match service.service_type {
             ServiceType::Tcp => {
-                let _ = events.send(ServerEvent::ServiceUp {
+                let _ = event_tx.send(ServerServiceEvent::Connected {
                     config: service.clone(),
-                    visitors: VisitorSender {
+                    visitor_tx: VisitorStreamSender {
                         data_ch_req_tx: data_ch_req_tx.clone(),
                         visitor_tx,
                     },
                 });
-                Some(events)
+                Some(event_tx)
             }
             ServiceType::Udp => None,
         };
@@ -611,7 +614,7 @@ where
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
             service,
-            events,
+            event_tx,
         }
     }
 }
@@ -674,7 +677,7 @@ impl<T: Transport> ControlChannel<T> {
 
 fn tcp_listen_and_send(
     addr: String,
-    visitors: VisitorSender,
+    visitor_tx: VisitorStreamSender,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) {
     tokio::spawn(async move {
@@ -725,7 +728,7 @@ fn tcp_listen_and_send(
                             debug!("New visitor from {}", addr);
 
                             // Send the visitor to the client
-                            if visitors.send(Box::new(incoming)).await.is_err() {
+                            if visitor_tx.send(Box::new(incoming)).await.is_err() {
                                 // An error indicates the control channel is broken
                                 // So break the loop
                                 break;
