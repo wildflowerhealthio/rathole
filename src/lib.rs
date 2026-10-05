@@ -12,7 +12,7 @@ use cli::KeypairType;
 pub use config::{ClientServiceConfig, Config, ServerServiceConfig, ServiceType};
 pub use config_watcher::{ClientServiceChange, ConfigChange, ServerServiceChange};
 pub use constants::UDP_BUFFER_SIZE;
-pub use helper::{AsyncStream, BoxedStream};
+pub use helper::AsyncStream;
 
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};

@@ -3,7 +3,7 @@
 use anyhow::{Ok, Result};
 use common::{PING, PONG};
 use rand::Rng;
-use rathole::{BoxedStream, ClientEvent, Config, ServerEvent, ServiceType, VisitorSender};
+use rathole::{AsyncStream, ClientEvent, Config, ServerEvent, ServiceType, VisitorSender};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -275,7 +275,7 @@ async fn run_rathole_client(
 }
 
 // Serve `data_channel` as tests/common serves the TCP service `name`
-fn serve(name: &str, data_channel: BoxedStream) {
+fn serve(name: &str, data_channel: Box<dyn AsyncStream>) {
     match name {
         "echo" => tokio::spawn(async move {
             let (mut rd, mut wr) = tokio::io::split(data_channel);

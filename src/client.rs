@@ -1,6 +1,6 @@
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
-use crate::helper::{udp_connect, BoxedStream};
+use crate::helper::{udp_connect, AsyncStream};
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
@@ -44,7 +44,7 @@ pub enum ClientEvent {
     /// to `local_addr`
     ServiceUp {
         config: ClientServiceConfig,
-        data_channels: mpsc::Receiver<BoxedStream>,
+        data_channels: mpsc::Receiver<Box<dyn AsyncStream>>,
     },
     /// The service stopped. Its `data_channels` ends once the data channels
     /// already opened are sent
@@ -84,7 +84,10 @@ pub async fn run_client(
 }
 
 // Forward each data channel received over a local connection to `local_addr`
-async fn forward_to_local_addr(local_addr: String, mut data_channels: mpsc::Receiver<BoxedStream>) {
+async fn forward_to_local_addr(
+    local_addr: String,
+    mut data_channels: mpsc::Receiver<Box<dyn AsyncStream>>,
+) {
     while let Some(conn) = data_channels.recv().await {
         let local_addr = local_addr.clone();
         tokio::spawn(
@@ -258,7 +261,7 @@ struct RunDataChannelArgs<T: Transport> {
     connector: Arc<T>,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
-    data_channels: mpsc::Sender<BoxedStream>,
+    data_channels: mpsc::Sender<Box<dyn AsyncStream>>,
 }
 
 async fn do_data_channel_handshake<T: Transport>(
@@ -328,7 +331,7 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
 
 // Simply copying back and forth for TCP
 #[instrument(skip(conn))]
-async fn run_data_channel_for_tcp(mut conn: BoxedStream, local_addr: &str) -> Result<()> {
+async fn run_data_channel_for_tcp(mut conn: Box<dyn AsyncStream>, local_addr: &str) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let mut local = TcpStream::connect(local_addr)
@@ -483,7 +486,7 @@ struct ControlChannel<T: Transport> {
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
     // Where the service's TCP data channels are sent once forwarding
-    data_channels: mpsc::Sender<BoxedStream>,
+    data_channels: mpsc::Sender<Box<dyn AsyncStream>>,
 }
 
 // Handle of a control channel

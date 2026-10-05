@@ -13,14 +13,10 @@ use url::Url;
 
 use crate::transport::AddrMaybeCached;
 
-/// A byte stream of any kind: a data channel of any transport, or a visitor
+/// A bidirectional connection of any kind: a data channel of any transport, or a visitor
 pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send + Sync + Debug + 'static {}
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync + Debug + 'static> AsyncStream for T {}
-
-/// A boxed `AsyncStream`: a visitor on the server, or a data channel on the
-/// client
-pub type BoxedStream = Box<dyn AsyncStream>;
 
 // Tokio hesitates to expose this option...So we have to do it on our own :(
 // The good news is that using socket2 it can be easily done, without losing portability.
@@ -74,7 +70,6 @@ pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
 
 /// Create a UDP socket and connect to `addr`
 pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result<UdpSocket> {
-
     let (socket_addr, bind_addr);
 
     match prefer_ipv6 {
@@ -85,7 +80,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
                 SocketAddr::V4(_) => "0.0.0.0:0",
                 SocketAddr::V6(_) => ":::0",
             };
-        },
+        }
         true => {
             let all_host_addresses: Vec<SocketAddr> = lookup_host(addr).await?.collect();
 
@@ -94,7 +89,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
                 Some(socket_addr_ipv6) => {
                     socket_addr = *socket_addr_ipv6;
                     bind_addr = ":::0";
-                },
+                }
                 None => {
                     let socket_addr_ipv4 = all_host_addresses.iter().find(|x| x.is_ipv4());
                     match socket_addr_ipv4 {

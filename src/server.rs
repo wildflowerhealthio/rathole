@@ -1,7 +1,7 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
-use crate::helper::{retry_notify_with_deadline, write_and_flush, BoxedStream};
+use crate::helper::{retry_notify_with_deadline, write_and_flush, AsyncStream};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
@@ -60,14 +60,14 @@ pub enum ServerEvent {
 #[derive(Clone, Debug)]
 pub struct VisitorSender {
     data_ch_req_tx: mpsc::UnboundedSender<bool>, // Requests a data channel for the visitor
-    visitor_tx: mpsc::Sender<BoxedStream>,       // Sends the visitor to the connection pool
+    visitor_tx: mpsc::Sender<Box<dyn AsyncStream>>,       // Sends the visitor to the connection pool
 }
 
 impl VisitorSender {
     /// Forward `visitor` to the client over a new data channel. Waits while
     /// the visitor queue is full, and returns the visitor if the control
     /// channel is gone
-    pub async fn send(&self, visitor: BoxedStream) -> std::result::Result<(), BoxedStream> {
+    pub async fn send(&self, visitor: Box<dyn AsyncStream>) -> std::result::Result<(), Box<dyn AsyncStream>> {
         // For every visitor, request to create a data channel
         if self.data_ch_req_tx.send(true).is_err() {
             // An error indicates the control channel is broken
@@ -752,7 +752,7 @@ fn tcp_listen_and_send(
 
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<T: Transport>(
-    mut visitor_rx: mpsc::Receiver<BoxedStream>,
+    mut visitor_rx: mpsc::Receiver<Box<dyn AsyncStream>>,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
