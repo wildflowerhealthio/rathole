@@ -1,6 +1,6 @@
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
-use crate::helper::udp_connect;
+use crate::helper::{udp_connect, AsyncStream};
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
@@ -19,7 +19,7 @@ use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
-use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
+use tracing::{debug, error, info, info_span, instrument, trace, warn, Instrument, Span};
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
@@ -30,11 +30,92 @@ use crate::transport::WebsocketTransport;
 
 use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
 
+const VISITOR_STREAM_QUEUE_SIZE: usize = 32; // The capacity of each service's visitor stream queue
+
+/// A change in the services run by `run_client_with_visitor_queue`
+#[derive(Debug)]
+pub enum ClientServiceEvent {
+    /// The TCP service started, and its control channel is connecting to the
+    /// server. Each visitor arrives on `visitor_stream_rx` as a visitor stream,
+    /// for the caller to serve in place of a local connection to `local_addr`.
+    /// A visitor stream is a data channel that the server has sent
+    /// `StartForwardTcp` on, so it carries the bytes of exactly one visitor
+    TcpStarted {
+        config: ClientServiceConfig,
+        visitor_stream_rx: mpsc::Receiver<Box<dyn AsyncStream>>,
+    },
+    /// The UDP service started, and its control channel is connecting to the
+    /// server. Its visitors are forwarded to `local_addr` as usual
+    UdpStarted { config: ClientServiceConfig },
+    /// The service stopped. The `visitor_stream_rx` of a TCP service ends once
+    /// the visitor streams already opened are sent
+    Stopped { name: String },
+}
+
 // The entrypoint of running a client
 pub async fn run_client(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
+) -> Result<()> {
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+    // Make a local connection to `local_addr` for each visitor stream. The events end
+    // once the client has stopped every service
+    let local_forwarding_client_event_handler = async move {
+        while let Some(event) = event_rx.recv().await {
+            if let ClientServiceEvent::TcpStarted {
+                config,
+                visitor_stream_rx,
+            } = event
+            {
+                let span = info_span!("handle", service = %config.name);
+                tokio::spawn(
+                    forward_received_streams_to_local_addr(config.local_addr, visitor_stream_rx)
+                        .instrument(span),
+                );
+            }
+        }
+    };
+
+    let (ret, _) = tokio::join!(
+        run_client_with_visitor_queue(config, shutdown_rx, update_rx, event_tx),
+        local_forwarding_client_event_handler
+    );
+    ret
+}
+
+// Forward each visitor stream received over a local connection to `local_addr`
+async fn forward_received_streams_to_local_addr(
+    local_addr: String,
+    mut visitor_stream_rx: mpsc::Receiver<Box<dyn AsyncStream>>,
+) {
+    while let Some(conn) = visitor_stream_rx.recv().await {
+        let local_addr = local_addr.clone();
+        tokio::spawn(
+            async move {
+                if let Err(e) = run_data_channel_for_tcp(conn, &local_addr)
+                    .await
+                    .with_context(|| "Failed to run the data channel")
+                {
+                    warn!("{:#}", e);
+                }
+            }
+            .instrument(Span::current()),
+        );
+    }
+}
+
+/// Run a client that makes no local connections for TCP services. Instead each
+/// TCP service reports a visitor queue in `event_tx`, and its visitor streams
+/// come out of the queue for the caller to serve, until `shutdown_rx` fires.
+/// UDP services are reported too, but are forwarded to their `local_addr` as
+/// usual.
+pub async fn run_client_with_visitor_queue(
+    config: Config,
+    shutdown_rx: broadcast::Receiver<bool>,
+    update_rx: mpsc::Receiver<ConfigChange>,
+    event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
 ) -> Result<()> {
     let config = config.client.ok_or_else(|| {
         anyhow!(
@@ -44,13 +125,13 @@ pub async fn run_client(
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut client = Client::<TcpTransport>::from(config).await?;
+            let mut client = Client::<TcpTransport>::from(config, event_tx).await?;
             client.run(shutdown_rx, update_rx).await
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut client = Client::<TlsTransport>::from(config).await?;
+                let mut client = Client::<TlsTransport>::from(config, event_tx).await?;
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -59,7 +140,7 @@ pub async fn run_client(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut client = Client::<NoiseTransport>::from(config).await?;
+                let mut client = Client::<NoiseTransport>::from(config, event_tx).await?;
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(feature = "noise"))]
@@ -68,7 +149,7 @@ pub async fn run_client(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut client = Client::<WebsocketTransport>::from(config).await?;
+                let mut client = Client::<WebsocketTransport>::from(config, event_tx).await?;
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -85,17 +166,22 @@ struct Client<T: Transport> {
     config: ClientConfig,
     service_handles: HashMap<String, ControlChannelHandle>,
     transport: Arc<T>,
+    service_event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
 }
 
 impl<T: 'static + Transport> Client<T> {
     // Create a Client from `[client]` config block
-    async fn from(config: ClientConfig) -> Result<Client<T>> {
+    async fn from(
+        config: ClientConfig,
+        service_event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
+    ) -> Result<Client<T>> {
         let transport =
             Arc::new(T::new(&config.transport).with_context(|| "Failed to create the transport")?);
         Ok(Client {
             config,
             service_handles: HashMap::new(),
             transport,
+            service_event_tx,
         })
     }
 
@@ -112,11 +198,13 @@ impl<T: 'static + Transport> Client<T> {
                 self.config.remote_addr.clone(),
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
+                self.service_event_tx.clone(),
             );
             self.service_handles.insert(name.clone(), handle);
         }
 
         // Wait for the shutdown signal
+        let mut update_closed = false;
         loop {
             tokio::select! {
                 val = shutdown_rx.recv() => {
@@ -128,9 +216,10 @@ impl<T: 'static + Transport> Client<T> {
                     }
                     break;
                 },
-                e = update_rx.recv() => {
-                    if let Some(e) = e {
-                        self.handle_hot_reload(e).await;
+                e = update_rx.recv(), if !update_closed => {
+                    match e {
+                        Some(e) => self.handle_hot_reload(e).await,
+                        None => update_closed = true,
                     }
                 }
             }
@@ -149,11 +238,14 @@ impl<T: 'static + Transport> Client<T> {
             ConfigChange::ClientChange(client_change) => match client_change {
                 ClientServiceChange::Add(cfg) => {
                     let name = cfg.name.clone();
+                    // Stop the service being replaced before starting the new one
+                    let _ = self.service_handles.remove(&name);
                     let handle = ControlChannelHandle::new(
                         cfg,
                         self.config.remote_addr.clone(),
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
+                        self.service_event_tx.clone(),
                     );
                     let _ = self.service_handles.insert(name, handle);
                 }
@@ -172,6 +264,7 @@ struct RunDataChannelArgs<T: Transport> {
     connector: Arc<T>,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
+    visitor_stream_tx: mpsc::Sender<Box<dyn AsyncStream>>,
 }
 
 async fn do_data_channel_handshake<T: Transport>(
@@ -221,13 +314,20 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
-            run_data_channel_for_tcp::<T>(conn, &args.service.local_addr).await?;
+            // Hand the data channel, now a visitor stream, to whoever serves
+            // the service. Waits while the service's visitor streams are not
+            // being taken
+            args.visitor_stream_tx
+                .send(Box::new(conn))
+                .await
+                .map_err(|_| anyhow!("The service is stopped"))?;
         }
         DataChannelCmd::StartForwardUdp => {
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
+                .await?;
         }
     }
     Ok(())
@@ -235,10 +335,7 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
 
 // Simply copying back and forth for TCP
 #[instrument(skip(conn))]
-async fn run_data_channel_for_tcp<T: Transport>(
-    mut conn: T::Stream,
-    local_addr: &str,
-) -> Result<()> {
+async fn run_data_channel_for_tcp(mut conn: Box<dyn AsyncStream>, local_addr: &str) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let mut local = TcpStream::connect(local_addr)
@@ -255,7 +352,11 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(
+    conn: T::Stream,
+    local_addr: &str,
+    prefer_ipv6: bool,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -392,12 +493,28 @@ struct ControlChannel<T: Transport> {
     remote_addr: String,                // `client.remote_addr`
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
+    // Where the service's TCP visitor streams are sent
+    visitor_stream_tx: mpsc::Sender<Box<dyn AsyncStream>>,
 }
 
 // Handle of a control channel
 // Dropping it will also drop the actual control channel
 struct ControlChannelHandle {
     shutdown_tx: oneshot::Sender<u8>,
+    _stopped: ServiceStoppedGuard, // Reports the service stopped when dropped
+}
+
+struct ServiceStoppedGuard {
+    name: String,
+    event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
+}
+
+impl Drop for ServiceStoppedGuard {
+    fn drop(&mut self) {
+        let _ = self.event_tx.send(ClientServiceEvent::Stopped {
+            name: std::mem::take(&mut self.name),
+        });
+    }
 }
 
 impl<T: 'static + Transport> ControlChannel<T> {
@@ -461,6 +578,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             connector: self.transport.clone(),
             socket_opts,
             service: self.service.clone(),
+            visitor_stream_tx: self.visitor_stream_tx.clone(),
         });
 
         loop {
@@ -501,11 +619,30 @@ impl ControlChannelHandle {
         remote_addr: String,
         transport: Arc<T>,
         heartbeat_timeout: u64,
+        event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
     ) -> ControlChannelHandle {
         let digest = protocol::digest(service.name.as_bytes());
 
         info!("Starting {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        // Report the service started, with where a TCP service's visitor
+        // streams are sent. UDP data channels still make their own local
+        // connection to `local_addr`
+        let (visitor_stream_tx, visitor_stream_rx) = mpsc::channel(VISITOR_STREAM_QUEUE_SIZE);
+        let _ = event_tx.send(match service.service_type {
+            ServiceType::Tcp => ClientServiceEvent::TcpStarted {
+                config: service.clone(),
+                visitor_stream_rx,
+            },
+            ServiceType::Udp => ClientServiceEvent::UdpStarted {
+                config: service.clone(),
+            },
+        });
+        let stopped = ServiceStoppedGuard {
+            name: service.name.clone(),
+            event_tx,
+        };
 
         let mut retry_backoff = run_control_chan_backoff(service.retry_interval.unwrap());
 
@@ -516,6 +653,7 @@ impl ControlChannelHandle {
             remote_addr,
             transport,
             heartbeat_timeout,
+            visitor_stream_tx,
         };
 
         tokio::spawn(
@@ -550,7 +688,10 @@ impl ControlChannelHandle {
             .instrument(Span::current()),
         );
 
-        ControlChannelHandle { shutdown_tx }
+        ControlChannelHandle {
+            shutdown_tx,
+            _stopped: stopped,
+        }
     }
 
     fn shutdown(self) {

@@ -9,8 +9,10 @@ mod transport;
 
 pub use cli::Cli;
 use cli::KeypairType;
-pub use config::Config;
+pub use config::{ClientServiceConfig, Config, ServerServiceConfig, ServiceType};
+pub use config_watcher::{ClientServiceChange, ConfigChange, ServerServiceChange};
 pub use constants::UDP_BUFFER_SIZE;
+pub use helper::AsyncStream;
 
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
@@ -19,14 +21,14 @@ use tracing::{debug, info};
 #[cfg(feature = "client")]
 mod client;
 #[cfg(feature = "client")]
-use client::run_client;
+pub use client::{run_client, run_client_with_visitor_queue, ClientServiceEvent};
 
 #[cfg(feature = "server")]
 mod server;
 #[cfg(feature = "server")]
-use server::run_server;
+pub use server::{run_server, run_server_with_visitor_queue, ServerServiceEvent};
 
-use crate::config_watcher::{ConfigChange, ConfigWatcherHandle};
+use crate::config_watcher::ConfigWatcherHandle;
 
 const DEFAULT_CURVE: KeypairType = KeypairType::X25519;
 
