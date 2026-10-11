@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::path::Path;
+use std::str::FromStr;
 use tokio::fs;
 use url::Url;
 
@@ -236,7 +237,9 @@ pub struct Config {
     pub client: Option<ClientConfig>,
 }
 
-impl Config {
+impl FromStr for Config {
+    type Err = anyhow::Error;
+
     fn from_str(s: &str) -> Result<Config> {
         let mut config: Config = toml::from_str(s).with_context(|| "Failed to parse the config")?;
 
@@ -254,7 +257,9 @@ impl Config {
             Ok(config)
         }
     }
+}
 
+impl Config {
     fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
         // Validate services
         for (name, s) in &mut server.services {

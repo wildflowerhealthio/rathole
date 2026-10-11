@@ -1,11 +1,10 @@
 use crate::config::{ClientServiceConfig, ServerServiceConfig, TcpConfig, TransportConfig};
-use crate::helper::{to_socket_addr, try_set_tcp_keepalive};
+use crate::helper::{to_socket_addr, try_set_tcp_keepalive, AsyncStream};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::fmt::{Debug, Display};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tracing::{error, trace};
 
@@ -53,7 +52,7 @@ impl Display for AddrMaybeCached {
 pub trait Transport: Debug + Send + Sync {
     type Acceptor: Send + Sync;
     type RawStream: Send + Sync;
-    type Stream: 'static + AsyncRead + AsyncWrite + Unpin + Send + Sync + Debug;
+    type Stream: AsyncStream;
 
     fn new(config: &TransportConfig) -> Result<Self>
     where
