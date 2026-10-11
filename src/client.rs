@@ -52,6 +52,63 @@ pub enum ClientServiceEvent {
     Stopped { name: String },
 }
 
+/// A change in the control channel of a service run by
+/// `run_client_with_visitor_queue`
+#[derive(Debug)]
+pub enum ControlChannelState {
+    /// The server accepted the service, and its control channel is established
+    Connected { name: String },
+    /// The control channel failed or was refused, and is retried in `retry_in`
+    /// unless the service stops first
+    Disconnected {
+        name: String,
+        error: ControlChannelError,
+        retry_in: Duration,
+    },
+}
+
+/// Why a control channel failed or was refused
+#[derive(Debug)]
+pub enum ControlChannelError {
+    /// The server knows the service, but its token is wrong
+    AuthFailed,
+    /// The server has no service of that name
+    ServiceNotExist,
+    /// Anything else, such as failing to connect, a transport error, or a
+    /// heartbeat timeout
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for ControlChannelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControlChannelError::AuthFailed => {
+                write!(f, "Authentication failed: {}", Ack::AuthFailed)
+            }
+            ControlChannelError::ServiceNotExist => {
+                write!(f, "Authentication failed: {}", Ack::ServiceNotExist)
+            }
+            // `{:#}` shows the whole chain of the error, as for an `anyhow::Error`
+            ControlChannelError::Failed(e) if f.alternate() => write!(f, "{:#}", e),
+            ControlChannelError::Failed(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for ControlChannelError {}
+
+impl From<anyhow::Error> for ControlChannelError {
+    fn from(e: anyhow::Error) -> Self {
+        ControlChannelError::Failed(e)
+    }
+}
+
+impl From<io::Error> for ControlChannelError {
+    fn from(e: io::Error) -> Self {
+        ControlChannelError::Failed(e.into())
+    }
+}
+
 // The entrypoint of running a client
 pub async fn run_client(
     config: Config,
@@ -59,6 +116,32 @@ pub async fn run_client(
     update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (state_tx, mut state_rx) = mpsc::unbounded_channel();
+
+    // Log each change in the state of a control channel. The states end once
+    // every control channel has stopped, which may be after the client returns
+    tokio::spawn(async move {
+        while let Some(state) = state_rx.recv().await {
+            match state {
+                ControlChannelState::Connected { name } => {
+                    info_span!("handle", service = %name)
+                        .in_scope(|| info!("Control channel established"));
+                }
+                ControlChannelState::Disconnected {
+                    name,
+                    error,
+                    retry_in,
+                } => {
+                    info_span!("handle", service = %name).in_scope(|| {
+                        error!(
+                            "Failed to run the control channel: {:#}. Retry in {:?}...",
+                            error, retry_in
+                        )
+                    });
+                }
+            }
+        }
+    });
 
     // Make a local connection to `local_addr` for each visitor stream. The events end
     // once the client has stopped every service
@@ -79,7 +162,7 @@ pub async fn run_client(
     };
 
     let (ret, _) = tokio::join!(
-        run_client_with_visitor_queue(config, shutdown_rx, update_rx, event_tx),
+        run_client_with_visitor_queue(config, shutdown_rx, update_rx, event_tx, state_tx),
         local_forwarding_client_event_handler
     );
     ret
@@ -110,12 +193,14 @@ async fn forward_received_streams_to_local_addr(
 /// TCP service reports a visitor queue in `event_tx`, and its visitor streams
 /// come out of the queue for the caller to serve, until `shutdown_rx` fires.
 /// UDP services are reported too, but are forwarded to their `local_addr` as
-/// usual.
+/// usual. Each service's control channel reports its state in `state_tx`, and
+/// is retried after each failure until the service stops.
 pub async fn run_client_with_visitor_queue(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
     event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
+    state_tx: mpsc::UnboundedSender<ControlChannelState>,
 ) -> Result<()> {
     let config = config.client.ok_or_else(|| {
         anyhow!(
@@ -125,13 +210,13 @@ pub async fn run_client_with_visitor_queue(
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut client = Client::<TcpTransport>::from(config, event_tx).await?;
+            let mut client = Client::<TcpTransport>::from(config, event_tx, state_tx).await?;
             client.run(shutdown_rx, update_rx).await
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut client = Client::<TlsTransport>::from(config, event_tx).await?;
+                let mut client = Client::<TlsTransport>::from(config, event_tx, state_tx).await?;
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -140,7 +225,7 @@ pub async fn run_client_with_visitor_queue(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut client = Client::<NoiseTransport>::from(config, event_tx).await?;
+                let mut client = Client::<NoiseTransport>::from(config, event_tx, state_tx).await?;
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(feature = "noise"))]
@@ -149,7 +234,8 @@ pub async fn run_client_with_visitor_queue(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut client = Client::<WebsocketTransport>::from(config, event_tx).await?;
+                let mut client =
+                    Client::<WebsocketTransport>::from(config, event_tx, state_tx).await?;
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -167,6 +253,7 @@ struct Client<T: Transport> {
     service_handles: HashMap<String, ControlChannelHandle>,
     transport: Arc<T>,
     service_event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
+    control_channel_state_tx: mpsc::UnboundedSender<ControlChannelState>,
 }
 
 impl<T: 'static + Transport> Client<T> {
@@ -174,6 +261,7 @@ impl<T: 'static + Transport> Client<T> {
     async fn from(
         config: ClientConfig,
         service_event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
+        control_channel_state_tx: mpsc::UnboundedSender<ControlChannelState>,
     ) -> Result<Client<T>> {
         let transport =
             Arc::new(T::new(&config.transport).with_context(|| "Failed to create the transport")?);
@@ -182,6 +270,7 @@ impl<T: 'static + Transport> Client<T> {
             service_handles: HashMap::new(),
             transport,
             service_event_tx,
+            control_channel_state_tx,
         })
     }
 
@@ -199,6 +288,7 @@ impl<T: 'static + Transport> Client<T> {
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
                 self.service_event_tx.clone(),
+                self.control_channel_state_tx.clone(),
             );
             self.service_handles.insert(name.clone(), handle);
         }
@@ -246,6 +336,7 @@ impl<T: 'static + Transport> Client<T> {
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
                         self.service_event_tx.clone(),
+                        self.control_channel_state_tx.clone(),
                     );
                     let _ = self.service_handles.insert(name, handle);
                 }
@@ -495,6 +586,8 @@ struct ControlChannel<T: Transport> {
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
     // Where the service's TCP visitor streams are sent
     visitor_stream_tx: mpsc::Sender<Box<dyn AsyncStream>>,
+    // Where the state of the control channel is reported
+    state_tx: mpsc::UnboundedSender<ControlChannelState>,
 }
 
 // Handle of a control channel
@@ -519,7 +612,7 @@ impl Drop for ServiceStoppedGuard {
 
 impl<T: 'static + Transport> ControlChannel<T> {
     #[instrument(skip_all)]
-    async fn run(&mut self) -> Result<()> {
+    async fn run(&mut self) -> Result<(), ControlChannelError> {
         let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
         remote_addr.resolve().await?;
 
@@ -543,7 +636,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
         let nonce = match read_hello(&mut conn).await? {
             ControlChannelHello(_, d) => d,
             _ => {
-                bail!("Unexpected type of hello");
+                return Err(anyhow!("Unexpected type of hello").into());
             }
         };
 
@@ -561,14 +654,14 @@ impl<T: 'static + Transport> ControlChannel<T> {
         debug!("Reading ack");
         match read_ack(&mut conn).await? {
             Ack::Ok => {}
-            v => {
-                return Err(anyhow!("{}", v))
-                    .with_context(|| format!("Authentication failed: {}", self.service.name));
-            }
+            Ack::AuthFailed => return Err(ControlChannelError::AuthFailed),
+            Ack::ServiceNotExist => return Err(ControlChannelError::ServiceNotExist),
         }
 
         // Channel ready
-        info!("Control channel established");
+        let _ = self.state_tx.send(ControlChannelState::Connected {
+            name: self.service.name.clone(),
+        });
 
         // Socket options for the data channel
         let socket_opts = SocketOpts::from_client_cfg(&self.service);
@@ -599,7 +692,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {
-                    return Err(anyhow!("Heartbeat timed out"))
+                    return Err(anyhow!("Heartbeat timed out").into())
                 }
                 _ = &mut self.shutdown_rx => {
                     break;
@@ -620,6 +713,7 @@ impl ControlChannelHandle {
         transport: Arc<T>,
         heartbeat_timeout: u64,
         event_tx: mpsc::UnboundedSender<ClientServiceEvent>,
+        state_tx: mpsc::UnboundedSender<ControlChannelState>,
     ) -> ControlChannelHandle {
         let digest = protocol::digest(service.name.as_bytes());
 
@@ -654,17 +748,14 @@ impl ControlChannelHandle {
             transport,
             heartbeat_timeout,
             visitor_stream_tx,
+            state_tx,
         };
 
         tokio::spawn(
             async move {
                 let mut start = Instant::now();
 
-                while let Err(err) = s
-                    .run()
-                    .await
-                    .with_context(|| "Failed to run the control channel")
-                {
+                while let Err(err) = s.run().await {
                     if s.shutdown_rx.try_recv() != Err(oneshot::error::TryRecvError::Empty) {
                         break;
                     }
@@ -674,9 +765,13 @@ impl ControlChannelHandle {
                         retry_backoff.reset();
                     }
 
-                    if let Some(duration) = retry_backoff.next_backoff() {
-                        error!("{:#}. Retry in {:?}...", err, duration);
-                        time::sleep(duration).await;
+                    if let Some(retry_in) = retry_backoff.next_backoff() {
+                        let _ = s.state_tx.send(ControlChannelState::Disconnected {
+                            name: s.service.name.clone(),
+                            error: err,
+                            retry_in,
+                        });
+                        time::sleep(retry_in).await;
                     } else {
                         // Should never reach
                         panic!("{:#}. Break", err);

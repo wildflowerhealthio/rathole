@@ -21,7 +21,10 @@ use tracing::{debug, info};
 #[cfg(feature = "client")]
 mod client;
 #[cfg(feature = "client")]
-pub use client::{run_client, run_client_with_visitor_queue, ClientServiceEvent};
+pub use client::{
+    run_client, run_client_with_visitor_queue, ClientServiceEvent, ControlChannelError,
+    ControlChannelState,
+};
 
 #[cfg(feature = "server")]
 mod server;

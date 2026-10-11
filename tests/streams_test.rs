@@ -225,12 +225,14 @@ async fn run_rathole_client(
 ) -> Result<()> {
     let config = Config::from_file(Path::new(config_path)).await?;
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+    let (control_channel_state_tx, _control_channel_state_rx) = mpsc::unbounded_channel();
     let (_, config_change_rx) = mpsc::channel(1);
     let client = rathole::run_client_with_visitor_queue(
         config,
         shutdown_rx,
         config_change_rx,
         client_event_tx,
+        control_channel_state_tx,
     );
 
     let mut up_service_names = Vec::new();
