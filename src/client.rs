@@ -771,7 +771,11 @@ impl ControlChannelHandle {
                             error: err,
                             retry_in,
                         });
-                        time::sleep(retry_in).await;
+                        // Stop without retrying if the service stops during the backoff
+                        tokio::select! {
+                            _ = time::sleep(retry_in) => {}
+                            _ = &mut s.shutdown_rx => break,
+                        }
                     } else {
                         // Should never reach
                         panic!("{:#}. Break", err);

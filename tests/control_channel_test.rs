@@ -2,6 +2,8 @@
 
 use anyhow::Result;
 use rathole::{Config, ControlChannelError, ControlChannelState};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -102,6 +104,52 @@ async fn unknown_service_is_service_not_exist() -> Result<()> {
         "{:?}",
         state
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_during_backoff_stops_retrying() -> Result<()> {
+    init();
+
+    // A server that hangs up on each control channel, counting them
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let server_addr = listener.local_addr()?.to_string();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let counted_dials = dials.clone();
+    tokio::spawn(async move {
+        while let Ok((conn, _)) = listener.accept().await {
+            counted_dials.fetch_add(1, Ordering::SeqCst);
+            drop(conn);
+        }
+    });
+
+    let (client_shutdown_tx, mut state_rx, client) =
+        run_client(&server_addr, "echo", "token").await?;
+
+    let state = next_state(&mut state_rx).await;
+    let retry_in = match state {
+        ControlChannelState::Disconnected {
+            error: ControlChannelError::Failed(_),
+            retry_in,
+            ..
+        } => retry_in,
+        state => panic!("{:?}", state),
+    };
+
+    // Shut down as soon as the control channel is reported disconnected
+    client_shutdown_tx.send(true)?;
+    client.await??;
+
+    // The states end once the control channel stops, well before it would retry
+    let end = time::timeout(retry_in / 2, state_rx.recv()).await;
+    assert!(
+        matches!(end, Ok(None)),
+        "the control channel did not stop during the backoff"
+    );
+
+    // And no further dial is made after the backoff would have passed
+    time::sleep(retry_in * 2).await;
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
