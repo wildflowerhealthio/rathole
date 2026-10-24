@@ -1,19 +1,26 @@
 use anyhow::Result;
-use vergen::{vergen, Config, SemverKind};
+use vergen_gitcl::{Build, Cargo, Emitter, Gitcl};
 
 fn main() -> Result<()> {
-    let mut config = Config::default();
-    // Change the SEMVER output to the lightweight variant
-    *config.git_mut().semver_kind_mut() = SemverKind::Lightweight;
-    // Add a `-dirty` flag to the SEMVER output
-    *config.git_mut().semver_dirty_mut() = Some("-dirty");
-    // Generate the instructions
-    if let Err(e) = vergen(config) {
-        eprintln!("error occurred while generating instructions: {:?}", e);
-        let mut config = Config::default();
-        *config.git_mut().enabled_mut() = false;
-        vergen(config)
-    } else {
-        Ok(())
-    }
+    let build = Build::builder().build_timestamp(true).build();
+    let cargo = Cargo::builder()
+        .target_triple(true)
+        .debug(true)
+        .opt_level(true)
+        .features(true)
+        .build();
+    // Describe with lightweight tags and a `-dirty` suffix. Outside a git
+    // checkout (e.g. a crates.io or git-dependency build) the git instructions
+    // are skipped with a warning, so the `VERGEN_GIT_*` reads are `option_env!`.
+    let git = Gitcl::builder()
+        .describe(true, true, None)
+        .sha(false)
+        .commit_timestamp(true)
+        .branch(true)
+        .build();
+    Emitter::default()
+        .add_instructions(&build)?
+        .add_instructions(&cargo)?
+        .add_instructions(&git)?
+        .emit()
 }
